@@ -147,7 +147,9 @@ class CameraIntegrationTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(moved[1].rotation-bent[1].rotation), .2)
 
     def test_rendered_room_marker_is_detected(self):
-        self.data.qpos[3:7] = [math.sqrt(.5), 0, 0, math.sqrt(.5)]
+        # Room labels now flank the doorway rather than sitting mid-room, so
+        # face the door (the robot's spawn heading) to see one.
+        self.data.qpos[3:7] = [math.sqrt(.5), 0, 0, -math.sqrt(.5)]
         mujoco.mj_forward(self.model, self.data)
         _, frames = self.rig.sample(self.data)
         _, _, labels = FloorVision(load_config()).observe(frames)
