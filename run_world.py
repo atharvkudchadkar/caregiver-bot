@@ -21,6 +21,9 @@ Arrow keys (viewer window must have focus):
 """
 import argparse
 import math
+import os
+import shutil
+import sys
 import time
 
 import mujoco
@@ -29,7 +32,7 @@ import numpy as np
 
 import layout
 
-WORLD = "world.xml"
+WORLD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "world.xml")
 GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82}
 
 
@@ -127,7 +130,7 @@ class Arms:
     """Position targets for the arm, lift and gripper servos.
 
     Joint names are the URDF's: rj0/lj0 (lift, metres), rj1..rj6 / lj1..lj6
-    (radians), plus 'gripper_right' / 'gripper_left' (0 open .. 1 closed),
+    (radians), plus 'gripper_right' / 'gripper_left' (0 closed .. 1 open),
     which drive both finger servos together.
     """
 
@@ -282,6 +285,19 @@ def main():
                     help="arm/lift/gripper target, repeatable (e.g. rj1=0.4, gripper_right=0.8)")
     ap.add_argument("--no-avoid", action="store_true", help="disable lidar obstacle avoidance")
     args = ap.parse_args()
+
+    if sys.platform == "darwin" and not args.headless and os.environ.get("_CAREGIVER_MJPYTHON") != "1":
+        launcher = shutil.which("mjpython")
+        if launcher is None:
+            ap.error("interactive MuJoCo viewing on macOS requires mjpython; install it with mujoco")
+        env = os.environ.copy()
+        env["_CAREGIVER_MJPYTHON"] = "1"
+        os.execvpe(launcher, [launcher, os.path.abspath(__file__), *sys.argv[1:]], env)
+
+    if args.world == WORLD and not os.path.isfile(WORLD):
+        from build_world import build
+        print("world.xml is missing; generating it from the robot and wheelchair models")
+        build()
 
     model = mujoco.MjModel.from_xml_path(args.world)
     data = mujoco.MjData(model)

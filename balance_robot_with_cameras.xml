@@ -186,7 +186,7 @@
         <geom pos="0.011300804 0.16107869 -0.00697107326" quat="0.707106 -0.707108 -1.79246e-05 -1.77981e-05" type="mesh" rgba="0.301961 0.301961 0.301961 1" mesh="Right_Wheel_Tire__Right_Wheel_Tire" name="right_tire" friction="1.2 0.005 0.0001" />
         <geom pos="0.011300804 0.16107869 -0.00697107326" quat="0.707106 -0.707108 -1.79246e-05 -1.77981e-05" type="mesh" rgba="0.301961 0.301961 0.301961 1" mesh="Right_Wheel_Cap__Right_Wheel_Cap" name="right_cap" contype="0" conaffinity="0" />
       </body>
-      <camera name="head_camera" pos="0.065 0 1.575" xyaxes="0 -1 0 0 0 1" fovy="70" />
+      <camera name="head_camera" pos="0.065 0 1.575" xyaxes="0 -1 0 0.7660444 0 0.6427876" fovy="70" />
     </body>
     <geom name="floor" type="plane" size="0 0 0.1" pos="0 0 0" rgba="0.75 0.8 0.82 1" friction="1.2 0.005 0.0001" />
   </worldbody>

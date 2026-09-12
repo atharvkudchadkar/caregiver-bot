@@ -105,7 +105,10 @@ def build(obstacle=False):
     default = ET.SubElement(root, "default")
     wcd = ET.SubElement(default, "default", {"class": "wheelchair"})
     ET.SubElement(wcd, "joint", damping="0.5", armature="0.02")
-    ET.SubElement(wcd, "geom", density="300", friction="0.8 0.1 0.05", condim="3", **layout.COL_WORLD)
+    # Chair geoms accept floor/base/arm contacts but do not collide with one
+    # another (the source caster wheels otherwise intersect the footrests).
+    ET.SubElement(wcd, "geom", density="300", friction="0.8 0.1 0.05", condim="3",
+                  contype="8", conaffinity="5")
     ET.SubElement(wcd, "motor", ctrllimited="true", ctrlrange="-1 1")
     wall = ET.SubElement(default, "default", {"class": "wall"})
     ET.SubElement(wall, "geom", type="box", rgba="0.82 0.82 0.86 1", **layout.COL_WORLD)
@@ -114,6 +117,10 @@ def build(obstacle=False):
     asset = ET.SubElement(root, "asset")
     for mesh in robot.find("asset"):
         asset.append(copy.deepcopy(mesh))
+    ET.SubElement(asset, "texture", name="wc_aruco_texture", type="2d",
+                  file="assets/wheelchair_aruco_4x4_50_id0.png")
+    ET.SubElement(asset, "material", name="wc_aruco_material", texture="wc_aruco_texture",
+                  emission="1", specular="0", shininess="0")
     ET.SubElement(asset, "texture", name="grid", type="2d", builtin="checker",
                   rgb1="0.78 0.78 0.78", rgb2="0.68 0.68 0.7", width="512", height="512")
     ET.SubElement(asset, "material", name="grid", texture="grid", texrepeat="24 24", reflectance="0.05")
@@ -151,6 +158,34 @@ def build(obstacle=False):
     base.set("pos", fmt(*sp["pos"]))
     base.set("quat", yaw_quat(sp["yaw_deg"]))
     make_robot_solid(base)
+    for hand_name, side, grasp_pos in (
+        ("hand__hand", "right", "0.021785 -0.094351 -0.020721"),
+        ("l_hand__hand", "left", "0.002393 -0.095113 0.020571"),
+    ):
+        hand = base.find(f".//body[@name='{hand_name}']")
+        ET.SubElement(hand, "site", name=f"{side}_grasp", pos=grasp_pos,
+                      size="0.008", rgba="1 0.4 0 1")
+    # Flat fingertip pads give the simplified mesh fingers explicit opposing
+    # contact surfaces. Their local frames were measured from the finger mesh
+    # cross-sections at the handle grasp depth; local +Z faces the other jaw.
+    pads = (
+        ("right", "lower", "left_finger__left_finger", "-0.0422 -0.0107 -0.0295",
+         "-0.70157 -0.02082 0.71229 0.70952 0.07235 0.70096"),
+        ("right", "upper", "right_finger__right_finger", "0.0437 0.0053 0.0313",
+         "0.70165 -0.01815 -0.71229 0.70979 -0.06966 0.70096"),
+        ("left", "lower", "l_left_finger__left_finger", "0.0536 -0.0087 0.0201",
+         "0.57682 -0.33612 -0.74451 0.36424 -0.70996 0.60273"),
+        ("left", "upper", "l_right_finger__right_finger", "-0.0249 0.0066 -0.0031",
+         "-0.64231 0.18204 0.74451 0.76395 0.23045 0.60273"),
+    )
+    for side, jaw, body_name, pos, xyaxes in pads:
+        finger = base.find(f".//body[@name='{body_name}']")
+        ET.SubElement(finger, "geom", name=f"{side}_{jaw}_pad", type="box",
+                      pos=pos, xyaxes=xyaxes, size="0.022 0.013 0.006",
+                      rgba="0.10 0.10 0.12 1", mass="0.001", friction="1.2 0.02 0.001",
+                      contype="16", conaffinity="8")
+        ET.SubElement(finger, "site", name=f"{side}_{jaw}_pad_site", pos=pos,
+                      xyaxes=xyaxes, size="0.003", rgba="1 0.6 0 1")
     sensor = ET.Element("sensor")          # appended to root below
     add_lidar(base, sensor)
     wb.append(base)
@@ -162,12 +197,23 @@ def build(obstacle=False):
     chair.set("pos", fmt(*sp["pos"]))
     chair.set("quat", yaw_quat(sp["yaw_deg"]))
     chair.set("childclass", "wheelchair")
+    # Let the arm meshes interact with the handle tubes, while the chair's
+    # broad seat/backrest stay out of the path of the prescribed reach.
+    handle_names = {f"wc_{side}_{part}" for side in ("left", "right")
+                    for part in ("push_handle", "handle_grip")}
+    for geom in chair.iter("geom"):
+        if geom.get("name") not in handle_names:
+            geom.set("conaffinity", "1")
     wb.append(chair)
 
     # Constraints / actuators / sensors from both sources.
     equality = ET.SubElement(root, "equality")
     for eq in robot.find("equality"):
         equality.append(copy.deepcopy(eq))
+    for side in ("right", "left"):
+        ET.SubElement(equality, "connect", name=f"{side}_wheelchair_grasp",
+                      site1=f"{side}_grasp", site2=f"wc_{side}_handle_grasp",
+                      active="false")
 
     actuator = ET.SubElement(root, "actuator")
     for act in robot.find("actuator"):
