@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <mujoco model="chopped_urdf_v2">
-  <compiler angle="radian" />
+  <compiler angle="radian" meshdir="robot" />
   <asset>
     <mesh name="Base_Extrusion__Base_Extrusion" content_type="model/stl" file="meshes/Base_Extrusion__Base_Extrusion.stl" />
     <mesh name="Base_Extrusion__Base_Extrusion__Base_Extrusion__Base_Extrusion" content_type="model/stl" file="meshes/Base_Extrusion__Base_Extrusion__Base_Extrusion__Base_Extrusion.stl" />
