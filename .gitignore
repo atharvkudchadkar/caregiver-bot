@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.png
+robot_converted.xml
+scene.xml
+robot/urdf/chopped_urdf_v2_mj.urdf
