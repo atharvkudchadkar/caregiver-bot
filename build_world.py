@@ -112,11 +112,20 @@ def add_room_labels(asset, wb, config):
         name = f"label_{marker_id}"
         ET.SubElement(asset, "texture", name=name, type="2d", file=f"assets/markers/{filename}")
         ET.SubElement(asset, "material", name=name, texture=name, texrepeat="1 1", texuniform="false")
-        x, y = layout.room_center(room)
-        bounds = layout.ROOMS[room]["y"]
-        y = bounds[1] - 0.45 if layout.is_north(room) else bounds[0] + 0.45
-        ET.SubElement(wb, "geom", name=name, type="plane", pos=fmt(x, y, 0.003),
-                      size="0.25 0.25 0.001", material=name, contype="0", conaffinity="0")
+        # One mat flanking each side of the doorway (entrance and exit),
+        # instead of one mat blocking the middle of the room.
+        for side, (x, y) in zip("ab", layout.marker_positions(room)):
+            ET.SubElement(wb, "geom", name=f"{name}_{side}", type="plane", pos=fmt(x, y, 0.003),
+                          size="0.25 0.25 0.001", material=name, contype="0", conaffinity="0")
+
+
+def add_furniture(wb):
+    """Static props: boxes/cylinders only, collidable like walls."""
+    for room, items in layout.furniture().items():
+        for item in items:
+            ET.SubElement(wb, "geom", name=f"{room}_{item['name']}", type=item["type"],
+                          pos=fmt(*item["pos"]), size=fmt(*item["size"]),
+                          rgba=fmt(*item["rgba"]), **layout.COL_WORLD)
 
 
 def build(obstacle=False, config_path=None):
@@ -172,6 +181,7 @@ def build(obstacle=False, config_path=None):
                       pos=fmt(cx, cy, layout.WALL_HALF_H), size=fmt(*size))
 
     add_room_labels(asset, wb, config)
+    add_furniture(wb)
 
     # Robot: the whole mobile_base subtree, plus a forward-looking head camera.
     base = copy.deepcopy(robot.find("worldbody/body[@name='mobile_base']"))
