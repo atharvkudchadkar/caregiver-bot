@@ -5,13 +5,20 @@ four_room_wheelchair_map_varied.xml (same four room sizes, same 1.5 m
 east-west hallway), rebuilt so that every room has a real 1.2 m doorway
 onto the hallway. In the original wall coordinates the hallway walls were
 continuous and the "doorway" segments overlapped, so no room was reachable.
+
+Room signs (ArUco code + English name) hang on the doorway wall beside each
+door, one on the hallway face and one on the room face, at a height the
+downward-pitched head camera can read. The robot only ever learns where they
+are by seeing them; nothing here is given to it.
 """
 
-WALL_HALF_T = 0.075       # 15 cm thick walls
-WALL_HALF_H = 0.6         # 1.2 m tall: you can see into rooms from the overview camera
+WALL_HALF_T = 0.075        # 15 cm thick walls
+WALL_HALF_H = 0.6          # 1.2 m tall: you can see into rooms from the overview camera
 DOOR_W = 1.2
-HALL_X = (-6.0, 6.0)      # hallway runs east-west along y = 0
+HALL_X = (-6.0, 6.0)       # hallway runs east-west along y = 0
 HALL_Y = (-0.75, 0.75)
+
+SIGN_Z = 0.95              # centre height of the door signs on the 1.2 m walls
 
 # Rooms north of the hallway have y[0] == HALL_Y[1]; rooms south have y[1] == HALL_Y[0].
 # door_x is the centre of the doorway on the hallway wall.
@@ -48,6 +55,16 @@ def is_north(room):
 def room_center(room):
     r = ROOMS[room]
     return ((r["x"][0] + r["x"][1]) / 2, (r["y"][0] + r["y"][1]) / 2)
+
+
+def door_center(room):
+    """(x, y) of the doorway centre line on the hallway wall."""
+    return (ROOMS[room]["door_x"], HALL_Y[1] if is_north(room) else HALL_Y[0])
+
+
+def door_normal_out(room):
+    """Unit vector pointing from the doorway into the hallway."""
+    return (0.0, -1.0) if is_north(room) else (0.0, 1.0)
 
 
 def wall_segments():

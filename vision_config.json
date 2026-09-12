@@ -1,6 +1,6 @@
 {
-  "width": 320,
-  "height": 240,
+  "width": 480,
+  "height": 360,
   "fps": 10,
   "fovy": 80,
   "wheel_radius": 0.0846,
@@ -9,14 +9,33 @@
   "map_size": 30.0,
   "resolution": 0.1,
   "robot_radius": 0.28,
-  "room_stop_distance": 0.6,
-  "max_range": 3.5,
-  "floor_channel_spread": 6,
+  "max_speed": 0.3,
+  "max_turn_rate": 0.6,
+  "scan_rate": 0.5,
+  "room_stop_distance": 0.45,
+  "entry_depth": 1.2,
+  "max_range": 4.5,
+  "floor_channel_spread": 8,
   "floor_min_value": 65,
-  "marker_rooms": {"0": "bedroom", "1": "kitchen", "2": "bathroom", "3": "living_room"},
+  "memory_path": "memory/apartment_memory.npz",
+  "marker_size": 0.34,
+  "marker_offset": -0.28,
+  "sign_door_offset": 1.25,
+  "sign_size": [1.0, 0.44],
+  "sign_image_flip": false,
+  "signs": {
+    "0":  {"room": "bedroom",     "side": "outside"},
+    "10": {"room": "bedroom",     "side": "inside"},
+    "1":  {"room": "kitchen",     "side": "outside"},
+    "11": {"room": "kitchen",     "side": "inside"},
+    "2":  {"room": "bathroom",    "side": "outside"},
+    "12": {"room": "bathroom",    "side": "inside"},
+    "3":  {"room": "living_room", "side": "outside"},
+    "13": {"room": "living_room", "side": "inside"}
+  },
   "cameras": [
-    {"name": "head_cam", "body": "mobile_base", "offset": [0.16, 0, 1.5], "yaw_deg": 0, "pitch_deg": 45},
-    {"name": "left_hand_cam", "body": "l_hand__hand", "offset": [0.12, 0.08, 0], "yaw_deg": 25, "pitch_deg": 45},
-    {"name": "right_hand_cam", "body": "hand__hand", "offset": [0.12, -0.08, 0], "yaw_deg": -25, "pitch_deg": 45}
+    {"name": "head_cam",       "body": "mobile_base",  "offset": [0.16, 0, 1.5],    "yaw_deg": 0,   "pitch_deg": 45},
+    {"name": "left_hand_cam",  "body": "l_hand__hand", "offset": [0.12, 0.08, 0],   "yaw_deg": 25,  "pitch_deg": 45},
+    {"name": "right_hand_cam", "body": "hand__hand",   "offset": [0.12, -0.08, 0],  "yaw_deg": -25, "pitch_deg": 45}
   ]
 }

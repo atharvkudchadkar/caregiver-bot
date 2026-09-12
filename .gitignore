@@ -2,7 +2,10 @@
 __pycache__/
 *.png
 assets/markers/
+memory/
 robot_converted.xml
 scene.xml
 world.xml
 robot/urdf/chopped_urdf_v2_mj.urdf
+MJMODEL.TXT
+MUJOCO_LOG.TXT

@@ -25,6 +25,7 @@ class CameraFrame:
     origin: np.ndarray          # local gravity-aligned base frame, metres
     rotation: np.ndarray        # OpenGL camera axes -> local base frame
     time: float
+    body: np.ndarray = None     # bool mask of pixels showing the robot's own body (self-view)
 
 
 class WheelOdometry:
@@ -72,7 +73,31 @@ class CameraRig:
         self.options = mujoco.MjvOption()
         self.options.geomgroup[3] = 0  # hidden collision proxies, as in the viewer
         self.options.sitegroup[:] = 0
+        # Geoms belonging to the robot itself (mobile_base subtree). The cameras see the
+        # robot's own arms, grippers and wheels; a self-view mask stands in for what a
+        # real robot derives from its kinematic model / a one-off calibration.
+        root = model.body("mobile_base").id
+        self.robot_geoms = np.zeros(model.ngeom, bool)
+        for g in range(model.ngeom):
+            b = model.geom_bodyid[g]
+            while b > 0 and b != root:
+                b = model.body_parentid[b]
+            self.robot_geoms[g] = (b == root)
         self.reset()
+
+    def self_mask(self, data, cid):
+        """Pixels of this camera's image covered by the robot's own body."""
+        self.renderer.enable_segmentation_rendering()
+        try:
+            self.renderer.update_scene(data, camera=cid, scene_option=self.options)
+            seg = self.renderer.render()
+        finally:
+            self.renderer.disable_segmentation_rendering()
+        ids, types = seg[..., 0], seg[..., 1]
+        geom = (types == int(mujoco.mjtObj.mjOBJ_GEOM)) & (ids >= 0)
+        mask = np.zeros(ids.shape, bool)
+        mask[geom] = self.robot_geoms[ids[geom]]
+        return mask
 
     def reset(self):
         self.odom.reset()
@@ -100,10 +125,12 @@ class CameraRig:
         for name, cid in zip(self.names, self.ids):
             f = h / (2 * math.tan(math.radians(self.model.cam_fovy[cid]) / 2))
             K = np.array([[f, 0, (w-1)/2], [0, f, (h-1)/2], [0, 0, 1]])
+            body = self.self_mask(data, cid)
             self.renderer.update_scene(data, camera=cid, scene_option=self.options)
             frames.append(CameraFrame(name, self.renderer.render().copy(), K,
                                       self.local.cam_xpos[cid].copy(),
-                                      self.local.cam_xmat[cid].reshape(3, 3).copy(), float(data.time)))
+                                      self.local.cam_xmat[cid].reshape(3, 3).copy(), float(data.time),
+                                      body))
         self.frames = frames
         return pose, frames
 
