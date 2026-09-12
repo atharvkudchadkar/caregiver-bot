@@ -64,7 +64,7 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(nav.command(np.zeros(3), 0), (0, 0))
         nav.last_frame = 0
         self.assertEqual(nav.command(np.zeros(3), 1), (0, 0))
-        frames = [CameraFrame(c["name"], np.zeros((240, 320, 3), np.uint8),
+        frames = [CameraFrame(c["name"], np.zeros((self.config["height"], self.config["width"], 3), np.uint8),
                               np.eye(3), np.array([0, 0, 1]), np.eye(3), 2)
                   for c in self.config["cameras"]]
         nav.observe(frames, np.zeros(3))
@@ -78,6 +78,42 @@ class NavigationTests(unittest.TestCase):
         grid.integrate(line, np.empty((0, 2)), {}, np.zeros(3))
         self.assertFalse(grid.safe_segment([0, 0], [1, 0]))
 
+    def test_unknown_space_behind_walls_is_not_a_frontier(self):
+        grid = ObservedMap(self.config)
+        grid.seen[140:161, 140:161] = True
+        grid.evidence[140:161, 140:161] = -4
+        grid.evidence[140, 140:161] = 5
+        grid.evidence[160, 140:161] = 5
+        grid.evidence[140:161, 140] = 5
+        grid.evidence[140:161, 160] = 5
+        self.assertEqual(grid.route([0, 0]), [])
+
+    def test_reobserves_a_disconnected_remembered_route_from_nearby(self):
+        grid = ObservedMap(self.config)
+        floor = np.array([(x, y) for x in np.arange(-1, 5, .05) for y in np.arange(-1, 1, .05)])
+        barrier = np.array([(3, y) for y in np.arange(-1, 1, .05)])
+        grid.integrate(floor, barrier, {}, np.zeros(3))
+        path = grid.route([0, 0], [4, 0])
+        self.assertTrue(path)
+        self.assertGreater(path[-1][0], 2)
+        self.assertLess(path[-1][0], 3)
+        self.assertTrue(all(grid.safe_segment(a, b) for a, b in zip(path, path[1:])))
+
+    def test_traveled_topology_guides_but_does_not_clear_new_obstacles(self):
+        grid = ObservedMap(self.config)
+        floor = np.array([(x, y) for x in np.arange(-1, 2, .05) for y in np.arange(-1, 2, .05)])
+        empty = np.empty((0, 2))
+        for x in np.arange(0, 1.01, .05):
+            grid.integrate(floor, empty, {}, np.array([x, 0, 0]))
+        for y in np.arange(0, 1.01, .05):
+            grid.integrate(floor, empty, {}, np.array([1, y, 0]))
+        history = grid.traveled_route([0, 0], [1, 1])
+        self.assertTrue(history)
+        self.assertTrue(all(min(abs(p[1]), abs(p[0]-1)) < .1 for p in history))
+        grid.integrate(empty, np.array([[.5, 0]]), {}, np.array([0, 0, 0]))
+        self.assertTrue(grid.traveled_route([0, 0], [1, 1]))
+        self.assertFalse(grid.safe_segment([0, 0], [1, 0]))
+
     def test_stalled_navigation_reports_blocked(self):
         nav = VisionNavigator(self.config, goal=[1, 0])
         nav.last_frame = 0
@@ -89,14 +125,7 @@ class NavigationTests(unittest.TestCase):
     def test_room_is_unknown_until_seen_in_rgb(self):
         nav = VisionNavigator(self.config, room="kitchen")
         self.assertIsNone(nav.goal)
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        rgb = np.full((240, 320, 3), 190, np.uint8)
-        rgb[72:168, 112:208] = cv2.aruco.generateImageMarker(dictionary, 1, 96)[..., None]
-        f = CameraFrame("head_cam", rgb, np.array([[200, 0, 160], [0, 200, 120], [0, 0, 1]]),
-                        np.array([1, 0, 1]), np.eye(3), 0)
-        _, _, labels = FloorVision(self.config).observe([f])
-        self.assertIn("kitchen", labels)
-        np.testing.assert_allclose(labels["kitchen"], [1, 0], atol=.01)
+        self.assertEqual(nav.memory.rooms, {})
 
     def test_navigator_has_no_simulator_or_layout_dependency(self):
         tree = ast.parse(Path("vision_navigation.py").read_text())
@@ -104,7 +133,11 @@ class NavigationTests(unittest.TestCase):
         imports += [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
         self.assertNotIn("layout", imports)
         self.assertNotIn("mujoco", imports)
-        self.assertNotIn("layout", Path("run_world.py").read_text())
+        for filename in ("run_world.py", "navigation_memory.py", "room_signs.py"):
+            source = ast.parse(Path(filename).read_text())
+            modules = [n.module for n in ast.walk(source) if isinstance(n, ast.ImportFrom)]
+            modules += [a.name for n in ast.walk(source) if isinstance(n, ast.Import) for a in n.names]
+            self.assertNotIn("layout", modules)
 
 
 class CameraIntegrationTests(unittest.TestCase):
@@ -123,7 +156,7 @@ class CameraIntegrationTests(unittest.TestCase):
         self.assertFalse(np.any(self.model.sensor_type == mujoco.mjtSensor.mjSENS_RANGEFINDER))
         _, frames = self.rig.sample(self.data)
         self.assertEqual(len(frames), 3)
-        self.assertTrue(all(f.rgb.shape == (240, 320, 3) for f in frames))
+        self.assertTrue(all(f.rgb.shape == (load_config()["height"], load_config()["width"], 3) for f in frames))
         self.assertNotIn("overview", [f.name for f in frames])
 
     def test_mounts_follow_hand_joints_and_ignore_world_pose(self):
@@ -153,7 +186,8 @@ class CameraIntegrationTests(unittest.TestCase):
         mujoco.mj_forward(self.model, self.data)
         _, frames = self.rig.sample(self.data)
         _, _, labels = FloorVision(load_config()).observe(frames)
-        self.assertIn("bedroom", labels)
+        self.assertTrue(any(o.room == "bedroom" and o.face == "inside" for o in labels))
+        self.assertTrue(any(abs(o.position[2]-.95) < .1 for o in labels))
 
     def test_reaches_local_goal_from_different_world_poses(self):
         from run_world import Arms, BalanceBase

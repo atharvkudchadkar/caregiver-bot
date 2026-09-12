@@ -4,6 +4,13 @@
   python run_world.py --goto kitchen           explore for the kitchen label
   python run_world.py --goto bathroom --headless --seconds 90
   python run_world.py --joint rj1=0.4 --joint rj0=-0.3 --joint gripper_right=0.8
+  python run_world.py --real-time              watch the viewer at 1x wall-clock speed
+
+The viewer runs as fast as the machine can simulate/render by default (headless
+mode always did). This only changes how quickly wall-clock time passes on
+screen; the robot's commanded speed, torque limits and control gains are all
+defined in simulated seconds and are untouched. Pass --real-time to cap the
+viewer back to 1x if you want to watch it move at its true pace.
 
 The balance law is the teammate's (run_balance.py), rewritten in the robot's
 body frame so it works at any heading and adds differential torque for
@@ -12,8 +19,8 @@ BalanceBase.command(v, w); the real Bracket Bot gets the same call.
 
 Navigation consumes three RGB cameras, wheel encoders and IMU tilt. It builds
 an observed free-space map and plans online, with no apartment coordinates or
-simulator base pose passed to the navigator. Room names refer to visible floor
-labels; unseen destinations require exploration.
+simulator base pose passed to the navigator. Room names are learned from English wall signs; codes anchor persistent
+localization memory, and unseen destinations require exploration.
 
 Arrow keys (viewer window must have focus):
   up/down     +/- 0.1 m/s forward speed      left/right   +/- 0.3 rad/s turn rate
@@ -183,21 +190,27 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--world", default=WORLD)
     goals = ap.add_mutually_exclusive_group()
-    goals.add_argument("--goto", metavar="ROOM", help="find a room by its visible floor label")
+    goals.add_argument("--goto", metavar="ROOM", help="navigate to a learned room, exploring if needed")
     goals.add_argument("--goal", nargs=2, type=float, metavar=("X", "Y"),
                        help="goal in metres relative to startup pose, x forward, y left")
     goals.add_argument("--explore", action="store_true", help="explore visible free space")
     ap.add_argument("--vision-config", help="camera and perception calibration JSON")
     ap.add_argument("--camera-preview", action="store_true", help="show all three RGB feeds and floor masks")
+    ap.add_argument("--memory", default="memory/robot_map.npz", help="learned map file, loaded and saved automatically")
+    ap.add_argument("--no-memory", action="store_true", help="run without loading or saving a map")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--seconds", type=float, default=60.0, help="headless run time")
+    ap.add_argument("--real-time", action="store_true",
+                    help="cap the viewer to wall-clock speed (default: run as fast as the "
+                         "machine can simulate/render; the robot's own commanded speed, "
+                         "torque limits and control gains are unaffected either way)")
     ap.add_argument("--joint", action="append", default=[], metavar="NAME=VALUE",
                     help="arm/lift/gripper target, repeatable")
     args = ap.parse_args()
     config = load_config(args.vision_config)
     room = args.goto.lower().strip().replace(" ", "_") if args.goto else None
-    if room and room not in config["marker_rooms"].values():
-        ap.error(f"unknown room {room!r}; labels: {list(config['marker_rooms'].values())}")
+    if room and room not in config["room_names"]:
+        ap.error(f"unknown room {room!r}; labels: {config['room_names']}")
     if args.goal and not np.isfinite(args.goal).all():
         ap.error("goal coordinates must be finite")
     model = mujoco.MjModel.from_xml_path(args.world)
@@ -208,13 +221,19 @@ def main():
         name, _, value = entry.partition("=")
         arms.set(name.strip(), float(value))
     rig = CameraRig(model, config)
-    nav = VisionNavigator(config, room=room, goal=args.goal)
+    memory_path = None if args.no_memory else args.memory
+    try:
+        nav = VisionNavigator(config, room=room, goal=args.goal, memory_path=memory_path)
+    except ValueError as error:
+        rig.close()
+        ap.error(str(error))
     autonomous = bool(room or args.goal is not None or args.explore)
     state = None
+    last_narration = last_save = -100.0
     print("RGB navigation: head + left hand + right hand; local wheel odometry; no preset routes")
 
     def control_tick():
-        nonlocal state
+        nonlocal state, last_narration, last_save
         pose, frames = rig.sample(data)
         if frames is not None:
             nav.observe(frames, pose)
@@ -223,10 +242,18 @@ def main():
                     base.command(*nav.command(pose, data.time))
                 else:
                     base.command(*nav.guard(pose, data.time, base.v_cmd, base.w_cmd))
-            if autonomous and nav.state != state:
+            for event in nav.memory.drain_events():
+                print(f"t={data.time:.1f}s {event}", flush=True)
+            if nav.state != state or data.time-last_narration >= 5:
                 state = nav.state
-                print(f"t={data.time:.1f}s {state} odom=({pose[0]:.2f}, {pose[1]:.2f}) "
-                      f"labels={list(nav.map.targets)}", flush=True)
+                last_narration = data.time
+                description = nav.explain(base.v_cmd, base.w_cmd) if autonomous else "Manual control: learning the visible layout and checking commanded clearance."
+                print(f"t={data.time:.1f}s [{state}] {description} "
+                      f"Mapped {nav.map.seen.sum()*config['resolution']**2:.1f} square metres.", flush=True)
+            if data.time-last_save >= 15:
+                if nav.memory.save():
+                    print(f"t={data.time:.1f}s Saved learned map to {memory_path}.", flush=True)
+                last_save = data.time
             if args.camera_preview:
                 import cv2
                 previews = []
@@ -244,7 +271,7 @@ def main():
         base.step()
 
     def on_key(keycode):
-        nonlocal autonomous, nav
+        nonlocal autonomous, nav, last_narration, last_save
         if keycode in (GLFW_KEYS[k] for k in ("up", "down", "left", "right", "space", "r")):
             autonomous = False
         if keycode == GLFW_KEYS["up"]:
@@ -258,9 +285,11 @@ def main():
         elif keycode == GLFW_KEYS["space"]:
             base.stop()
         elif keycode == GLFW_KEYS["r"]:
+            nav.memory.save()
             reset(model, data, base)
             rig.reset()
-            nav = VisionNavigator(config)
+            nav = VisionNavigator(config, memory_path=memory_path)
+            last_narration = last_save = -100.0
         else:
             return
         print(f"cmd v={base.v_cmd:+.1f} m/s  w={base.w_cmd:+.1f} rad/s")
@@ -269,7 +298,7 @@ def main():
         if args.headless:
             for _ in range(int(args.seconds / model.opt.timestep)):
                 control_tick()
-                if base.fallen or (autonomous and (nav.done or nav.state == "BLOCKED")):
+                if base.fallen or (autonomous and (nav.done or nav.state in ("BLOCKED", "LOCALIZATION_REQUIRED"))):
                     break
             x, y, yaw = rig.odom.pose
             print(f"t={data.time:.1f}s odom=({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f} deg) "
@@ -290,14 +319,24 @@ def main():
                 if base.fallen and not announced:
                     print("fell over: press r to reset")
                     announced = True
-                remaining = steps_per_frame * model.opt.timestep - (time.monotonic() - t0)
-                if remaining > 0:
-                    time.sleep(remaining)
+                if args.real_time:
+                    remaining = steps_per_frame * model.opt.timestep - (time.monotonic() - t0)
+                    if remaining > 0:
+                        time.sleep(remaining)
+    except KeyboardInterrupt:
+        base.stop()
+        print("Interrupted; stopping and saving learned memory.", flush=True)
     finally:
-        rig.close()
-        if args.camera_preview:
-            import cv2
-            cv2.destroyAllWindows()
+        try:
+            if nav.memory.save():
+                print(f"Saved {nav.map.seen.sum()} learned cells, {len(nav.memory.landmarks)} localization landmarks "
+                      f"and {len(nav.memory.rooms)} rooms to {memory_path}.", flush=True)
+        finally:
+            rig.close()
+            if args.camera_preview:
+                import cv2
+                cv2.destroyAllWindows()
+
 
 
 if __name__ == "__main__":

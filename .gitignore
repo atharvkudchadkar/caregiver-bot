@@ -2,6 +2,8 @@
 __pycache__/
 *.png
 assets/markers/
+memory/
+verification/
 robot_converted.xml
 scene.xml
 world.xml

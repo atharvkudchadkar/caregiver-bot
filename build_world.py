@@ -96,27 +96,28 @@ def add_cameras(base, config):
 
 
 def add_room_labels(asset, wb, config):
-    """Physical floor labels: ID-to-name is known, their locations are not."""
+    """Wall signs on both sides of each entrance; geometry stays in the builder."""
     import cv2
-    import numpy as np
+    from room_signs import sign_image
     directory = os.path.join(HERE, "assets", "markers")
     os.makedirs(directory, exist_ok=True)
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    for marker_id, room in config["marker_rooms"].items():
-        if room not in layout.ROOMS:
-            continue
-        image = np.full((256, 256), 255, np.uint8)
-        image[32:224, 32:224] = cv2.aruco.generateImageMarker(dictionary, int(marker_id), 192)
-        filename = f"room_{marker_id}.png"
-        cv2.imwrite(os.path.join(directory, filename), image)
-        name = f"label_{marker_id}"
-        ET.SubElement(asset, "texture", name=name, type="2d", file=f"assets/markers/{filename}")
-        ET.SubElement(asset, "material", name=name, texture=name, texrepeat="1 1", texuniform="false")
-        # One mat flanking each side of the doorway (entrance and exit),
-        # instead of one mat blocking the middle of the room.
-        for side, (x, y) in zip("ab", layout.marker_positions(room)):
-            ET.SubElement(wb, "geom", name=f"{name}_{side}", type="plane", pos=fmt(x, y, 0.003),
-                          size="0.25 0.25 0.001", material=name, contype="0", conaffinity="0")
+    for index, (room, bounds) in enumerate(layout.ROOMS.items()):
+        inward = 1 if layout.is_north(room) else -1
+        wall_y = bounds["y"][0] if inward > 0 else bounds["y"][1]
+        for side, face in enumerate(("inside", "entrance")):
+            marker_id = index * 2 + side
+            normal_y = inward if face == "inside" else -inward
+            name = f"sign_{room}_{face}"
+            filename = f"{name}.png"
+            cv2.imwrite(os.path.join(directory, filename), sign_image(marker_id, room, face))
+            ET.SubElement(asset, "texture", name=name, type="2d", file=f"assets/markers/{filename}")
+            ET.SubElement(asset, "material", name=name, texture=name, texrepeat="1 1", texuniform="false")
+            ET.SubElement(wb, "geom", name=name, type="plane",
+                          pos=fmt(bounds["door_x"] + layout.DOOR_W/2 + .45,
+                                  wall_y + normal_y*(layout.WALL_HALF_T+.004), .84),
+                          xyaxes=fmt(-normal_y, 0, 0, 0, 0, 1),
+                          size=fmt(.4*config["marker_size"]/.3, .3*config["marker_size"]/.3, .001),
+                          material=name, contype="0", conaffinity="0")
 
 
 def add_furniture(wb):
@@ -157,7 +158,7 @@ def build(obstacle=False, config_path=None):
         asset.append(copy.deepcopy(mesh))
     ET.SubElement(asset, "texture", name="grid", type="2d", builtin="checker",
                   rgb1="0.78 0.78 0.78", rgb2="0.68 0.68 0.7", width="512", height="512")
-    ET.SubElement(asset, "material", name="grid", texture="grid", texrepeat="24 24", reflectance="0.05")
+    ET.SubElement(asset, "material", name="grid", texture="grid", texrepeat="24 24", reflectance="0")
 
     wb = ET.SubElement(root, "worldbody")
     ET.SubElement(wb, "light", pos="0 0 10", dir="0 0 -1", directional="true", castshadow="false")
