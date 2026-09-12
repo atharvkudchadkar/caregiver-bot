@@ -25,8 +25,8 @@ HEIGHT, WIDTH = 360, 480
 MARKER_TO_HANDLE_X = -0.119  # handle grip is 119 mm behind the marker face
 PUSH_SPEED = 0.04
 PUSH_SECONDS = 4.0
-PREGRASP_BACKOFF = 0.14
-PREGRASP_SETTLE = 0.8
+ARM_SETUP_LATERAL = 0.14
+BASE_SLIDE_DISTANCE = 0.14
 OPEN_GRIP = 1.0
 CLOSED_GRIP = {"right": 0.14, "left": 0.0}
 PAD_CENTER_OFFSET = 0.028  # 21 mm rubber radius + 6 mm pad half-thickness + 1 mm clearance
@@ -228,13 +228,12 @@ class PushController:
         print(f"{self.data.time:.1f}s: {state}", flush=True)
 
     def apply_prescribed_pose(self):
-        if not self.arm_pose or self.state not in ("reach", "insert", "close", "verify", "push", "done"):
+        if not self.arm_pose or self.state not in ("arm_pregrasp", "move_in", "close", "verify", "push", "done"):
             return
         d = self.data
         qpos_before = d.qpos.copy()
         qvel_before = d.qvel.copy()
-        duration = 4 if self.state == "reach" else 2
-        arm_fraction = np.clip((d.time - self.state_start) / duration, 0, 1) if self.state in ("reach", "insert") else 1
+        arm_fraction = np.clip((d.time - self.state_start) / 4, 0, 1) if self.state == "arm_pregrasp" else 1
         for name, (qadr, dadr, target) in self.arm_pose.items():
             d.qpos[qadr] = self.arm_start[name] + arm_fraction * (target - self.arm_start[name])
             d.qvel[dadr] = 0
@@ -335,10 +334,11 @@ class PushController:
             return False
         return True
 
-    def plan_arm_pose(self, marker_pose, backoff=0.0):
+    def plan_arm_pose(self, marker_pose, lateral_backoff=0.0):
         targets = handle_targets(marker_pose)
-        if backoff:
-            targets = {side: point - backoff * marker_pose[1] for side, point in targets.items()}
+        if lateral_backoff:
+            targets = {side: point - lateral_backoff * marker_pose[1]
+                       for side, point in targets.items()}
         try:
             joints = solve_grasp_ik(self.model, self.data, targets, marker_pose[1])
         except RuntimeError as error:
@@ -386,36 +386,38 @@ class PushController:
         elif self.state == "align":
             self.base.stop()
             if d.time - self.state_start > 0.6:
-                if self.plan_arm_pose(self.marker_pose, PREGRASP_BACKOFF):
+                if self.plan_arm_pose(self.marker_pose, lateral_backoff=ARM_SETUP_LATERAL):
                     self.arms.gripper("right", OPEN_GRIP)
                     self.arms.gripper("left", OPEN_GRIP)
-                    self.change("pregrasp")
-        elif self.state == "pregrasp":
+                    self.change("arm_pregrasp")
+        elif self.state == "arm_pregrasp":
             self.base.stop()
-            if d.time - self.state_start > PREGRASP_SETTLE:
-                found = self.detector.detect(d)
-                if found is None:
-                    self.change("failed")
-                elif self.plan_arm_pose(found):
-                    self.marker_pose = found
-                    self.change("reach")
-        elif self.state == "reach":
             if d.time - self.state_start > 4:
-                found = self.detector.detect(d)
-                if found is None:
-                    self.change("failed")
-                elif self.plan_arm_pose(found):
-                    self.marker_pose = found
-                    self.change("insert")
-        elif self.state == "insert":
-            if d.time - self.state_start > 2:
-                if self.correct_grasp():
-                    for side in ("right", "left"):
-                        self.arms.gripper(side, CLOSED_GRIP[side])
-                    self.change("close")
+                x_axis = self.marker_pose[1]
+                self.slide_target = np.array(self.base.pose()[:2]) + BASE_SLIDE_DISTANCE * x_axis[:2]
+                self.change("move_in")
+        elif self.state == "arm_pregrasp":
+            self.base.stop()
+            if d.time - self.state_start > 4:
+                self.change("move_in")
+        elif self.state == "move_in":
+            _, x_axis, _ = self.marker_pose
+            _, _, yaw = self.base.pose()
+            bx, by, _ = self.base.pose()
+            delta = self.slide_target - np.array([bx, by])
+            distance = float(np.dot(delta, x_axis[:2]))
+            lateral = float(x_axis[0] * delta[1] - x_axis[1] * delta[0])
+            yaw_error = wrap(math.atan2(x_axis[1], x_axis[0]) - yaw)
+            if abs(yaw_error) < 0.07 and abs(distance) < 0.015 and abs(lateral) < 0.025:
+                self.base.stop()
+                for side in ("right", "left"):
+                    self.arms.gripper(side, CLOSED_GRIP[side])
+                self.change("close")
+            else:
+                self.base.command(np.clip(0.35 * distance, -0.08, 0.08) if abs(yaw_error) < 0.2 else 0,
+                                  np.clip(1.5 * yaw_error + 0.7 * lateral, -0.25, 0.25))
         elif self.state == "close" and d.time - self.state_start > 2:
-            if self.correct_grasp():
-                self.change("verify")
+            self.change("verify")
         elif self.state == "verify":
             clamped, contacts = self.clamp_status()
             if clamped:
