@@ -260,7 +260,8 @@ def build(obstacle=False, config_path=None):
         finger = base.find(f".//body[@name='{body_name}']")
         ET.SubElement(finger, "geom", name=f"{side}_{jaw}_pad", type="box",
                       pos=pos, xyaxes=xyaxes, size="0.022 0.013 0.006",
-                      rgba="0.10 0.10 0.12 1", mass="0.001", friction="1.2 0.02 0.001",
+                      rgba="0.10 0.10 0.12 1", mass="0.001",
+                      friction="1.8 0.08 0.01", condim="3",
                       contype="16", conaffinity="8")
         ET.SubElement(finger, "site", name=f"{side}_{jaw}_pad_site", pos=pos,
                       xyaxes=xyaxes, size="0.003", rgba="1 0.6 0 1")
@@ -281,7 +282,12 @@ def build(obstacle=False, config_path=None):
     handle_names = {f"wc_{side}_{part}" for side in ("left", "right")
                     for part in ("push_handle", "handle_grip")}
     for geom in chair.iter("geom"):
-        if geom.get("name") not in handle_names:
+        if geom.get("name") in handle_names:
+            geom.set("contype", "8")
+            geom.set("conaffinity", "16")
+            geom.set("friction", "1.8 0.08 0.01")
+            geom.set("condim", "3")
+        else:
             geom.set("conaffinity", "1")
     wb.append(chair)
 

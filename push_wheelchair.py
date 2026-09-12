@@ -26,9 +26,10 @@ MARKER_TO_HANDLE_X = -0.119  # handle grip is 119 mm behind the marker face
 PUSH_SPEED = 0.08
 PUSH_SECONDS = 4.0
 PREGRASP_BACKOFF = 0.14
+PREGRASP_SETTLE = 0.8
 OPEN_GRIP = 1.0
 CLOSED_GRIP = {"right": 0.14, "left": 0.0}
-PAD_CENTER_OFFSET = 0.024  # 21 mm rubber radius + 6 mm pad half-thickness - 3 mm compression
+PAD_CENTER_OFFSET = 0.028  # 21 mm rubber radius + 6 mm pad half-thickness + 1 mm clearance
 
 
 def obj_id(model, kind, name):
@@ -188,7 +189,6 @@ class PushController:
                                     obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"wc_{side}_push_handle")}
                              for side in ("right", "left")}
         self.all_handles = set().union(*self.handle_geoms.values())
-        self.all_pads = set(self.pad_geom.values())
         self.blocking_geoms = {g for g in range(model.ngeom)
                                if model.geom_contype[g] in (1, 4)
                                and not (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY,
@@ -212,10 +212,6 @@ class PushController:
         if state == "push":
             self.push_base_start = np.array(self.base.pose()[:2])
             self.push_chair_start = self.data.xpos[self.chair_body, :2].copy()
-        if state == "close":
-            for geom in self.pad_geom.values():
-                self.model.geom_contype[geom] = 16
-                self.model.geom_conaffinity[geom] = 8
         if state == "verify":
             self.clamp_since = None
         print(f"{self.data.time:.1f}s: {state}", flush=True)
@@ -249,25 +245,12 @@ class PushController:
 
     def handle_penetration(self):
         """Reject deep non-grasp collisions before committing prescribed motion."""
-        if self.state in ("reach", "insert"):
-            # Pads are contact-disabled while opening/approaching, but still
-            # checked geometrically so kinematic interpolation cannot tunnel.
-            for side in ("right", "left"):
-                for jaw in ("lower", "upper"):
-                    pad = self.pad_geom[(side, jaw)]
-                    for handle in self.handle_geoms[side]:
-                        distance = mujoco.mj_geomDistance(self.model, self.data, pad, handle, 0.02, None)
-                        if distance < -0.001:
-                            return (f"{side}_{jaw}_pad", float(distance))
         for contact in self.data.contact:
             pair = {contact.geom1, contact.geom2}
             if not pair.intersection(self.all_handles):
                 continue
             other = next(iter(pair - self.all_handles), None)
             if other in self.blocking_geoms and contact.dist < -0.003:
-                return (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, other),
-                        float(contact.dist))
-            if other in self.all_pads and contact.dist < -0.012:
                 return (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, other),
                         float(contact.dist))
         return None
@@ -381,6 +364,15 @@ class PushController:
                 if self.plan_arm_pose(self.marker_pose, PREGRASP_BACKOFF):
                     self.arms.gripper("right", OPEN_GRIP)
                     self.arms.gripper("left", OPEN_GRIP)
+                    self.change("pregrasp")
+        elif self.state == "pregrasp":
+            self.base.stop()
+            if d.time - self.state_start > PREGRASP_SETTLE:
+                found = self.detector.detect(d)
+                if found is None:
+                    self.change("failed")
+                elif self.plan_arm_pose(found):
+                    self.marker_pose = found
                     self.change("reach")
         elif self.state == "reach":
             if d.time - self.state_start > 4:
@@ -469,9 +461,6 @@ def main():
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[geom]) or ""
         if ("finger" in body_name or body_name in ("hand__hand", "l_hand__hand")) and model.geom_contype[geom] == 4:
             model.geom_contype[geom] = 0
-    # Activate only the small jaw pads when the fingers start closing.
-    model.geom_contype[model.geom_contype == 16] = 0
-    model.geom_conaffinity[model.geom_conaffinity == 8] = 0
     data = mujoco.MjData(model)
     set_demo_pose(model, data)
     controller = PushController(model, data)
