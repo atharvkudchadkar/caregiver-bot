@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mujoco model="average_manual_wheelchair">
+  <compiler angle="degree" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint damping="0.5" armature="0.02"/>
+    <geom density="300" friction="0.8 0.1 0.05" condim="3"/>
+    <motor ctrllimited="true" ctrlrange="-1 1"/>
+  </default>
+
+  <!--
+    APPROXIMATE ADULT MANUAL WHEELCHAIR
+    Units: meters, kilograms, seconds.
+    Overall width: ~0.68 m
+    Overall length: ~1.05 m
+    Seat height: ~0.50 m
+    Seat width: ~0.45 m
+    Seat depth: ~0.43 m
+    Back height above seat: ~0.45 m
+    Main wheel diameter: ~0.61 m
+    Front caster diameter: ~0.125 m
+    This is a simulation-friendly simplified model, not a manufacturing CAD model.
+
+    Standalone file (teammate's original). build_world.py extracts the
+    <body name="wheelchair"> subtree, prefixes every name with "wc_" and
+    converts the euler angles to radians so it can live in world.xml next
+    to the robot.
+  -->
+
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 0"
+          rgba="0.7 0.7 0.7 1"/>
+
+    <!-- Main frame / seat -->
+    <body name="wheelchair" pos="0 0 0">
+      <freejoint name="base_free"/>
+
+      <!-- Seat cushion: 0.45 W x 0.43 D x 0.05 H -->
+      <geom name="seat" type="box" size="0.225 0.215 0.025"
+            pos="0 0 0.525" rgba="0.15 0.15 0.15 1"/>
+
+      <!-- Seat/frame rails -->
+      <geom name="left_seat_rail" type="capsule" fromto="-0.22 0.20 0.50 0.22 0.20 0.50"
+            size="0.018"/>
+      <geom name="right_seat_rail" type="capsule" fromto="-0.22 -0.20 0.50 0.22 -0.20 0.50"
+            size="0.018"/>
+
+      <!-- Backrest -->
+      <geom name="backrest" type="box" size="0.025 0.225 0.225"
+            pos="-0.20 0 0.775" rgba="0.12 0.12 0.12 1"/>
+
+      <!-- Push handles -->
+      <geom name="left_push_handle" type="capsule"
+            fromto="-0.225 0.18 0.72 -0.225 0.18 1.00" size="0.014"/>
+      <geom name="right_push_handle" type="capsule"
+            fromto="-0.225 -0.18 0.72 -0.225 -0.18 1.00" size="0.014"/>
+
+      <!-- Rear frame supports -->
+      <geom name="left_rear_frame" type="capsule"
+            fromto="-0.20 0.20 0.50 -0.20 0.20 0.78" size="0.018"/>
+      <geom name="right_rear_frame" type="capsule"
+            fromto="-0.20 -0.20 0.50 -0.20 -0.20 0.78" size="0.018"/>
+
+      <!-- Footrests -->
+      <geom name="left_footrest" type="box" size="0.15 0.09 0.012"
+            pos="0.48 0.14 0.17" rgba="0.25 0.25 0.25 1"/>
+      <geom name="right_footrest" type="box" size="0.15 0.09 0.012"
+            pos="0.48 -0.14 0.17" rgba="0.25 0.25 0.25 1"/>
+
+      <!-- Front leg/footrest supports -->
+      <geom name="left_front_support" type="capsule"
+            fromto="0.20 0.18 0.50 0.48 0.14 0.18" size="0.014"/>
+      <geom name="right_front_support" type="capsule"
+            fromto="0.20 -0.18 0.50 0.48 -0.14 0.18" size="0.014"/>
+
+      <!-- LEFT MAIN WHEEL -->
+      <body name="left_main_wheel" pos="-0.05 0.335 0.36">
+        <joint name="left_wheel_joint" type="hinge"
+               axis="0 1 0" damping="0.15"/>
+        <geom name="left_main_wheel_geom" type="cylinder"
+              size="0.305 0.018" euler="90 0 0"
+              mass="2.0" friction="1.2 0.08 0.02"
+              rgba="0.05 0.05 0.05 1"/>
+        <geom name="left_wheel_hub" type="cylinder"
+              size="0.055 0.025" euler="90 0 0"
+              pos="0 0 0" mass="0.3" rgba="0.35 0.35 0.35 1"/>
+      </body>
+
+      <!-- RIGHT MAIN WHEEL -->
+      <body name="right_main_wheel" pos="-0.05 -0.335 0.36">
+        <joint name="right_wheel_joint" type="hinge"
+               axis="0 1 0" damping="0.15"/>
+        <geom name="right_main_wheel_geom" type="cylinder"
+              size="0.305 0.018" euler="90 0 0"
+              mass="2.0" friction="1.2 0.08 0.02"
+              rgba="0.05 0.05 0.05 1"/>
+        <geom name="right_wheel_hub" type="cylinder"
+              size="0.055 0.025" euler="90 0 0"
+              mass="0.3" rgba="0.35 0.35 0.35 1"/>
+      </body>
+
+      <!-- LEFT FRONT CASTER -->
+      <body name="left_caster" pos="0.42 0.18 0.125">
+        <joint name="left_caster_yaw" type="hinge"
+               axis="0 0 1" damping="0.2"/>
+        <geom name="left_caster_fork" type="capsule"
+              fromto="0 0 0.10 0 0 0.30" size="0.012"/>
+        <body name="left_caster_wheel" pos="0 0 0">
+          <joint name="left_caster_wheel_joint" type="hinge"
+                 axis="0 1 0" damping="0.05"/>
+          <geom name="left_caster_wheel_geom" type="cylinder"
+                size="0.0625 0.014" euler="90 0 0"
+                mass="0.25" friction="1.0 0.05 0.02"
+                rgba="0.08 0.08 0.08 1"/>
+        </body>
+      </body>
+
+      <!-- RIGHT FRONT CASTER -->
+      <body name="right_caster" pos="0.42 -0.18 0.125">
+        <joint name="right_caster_yaw" type="hinge"
+               axis="0 0 1" damping="0.2"/>
+        <geom name="right_caster_fork" type="capsule"
+              fromto="0 0 0.10 0 0 0.30" size="0.012"/>
+        <body name="right_caster_wheel" pos="0 0 0">
+          <joint name="right_caster_wheel_joint" type="hinge"
+                 axis="0 1 0" damping="0.05"/>
+          <geom name="right_caster_wheel_geom" type="cylinder"
+                size="0.0625 0.014" euler="90 0 0"
+                mass="0.25" friction="1.0 0.05 0.02"
+                rgba="0.08 0.08 0.08 1"/>
+        </body>
+      </body>
+
+      <!-- Armrests -->
+      <geom name="left_armrest" type="box" size="0.20 0.06 0.018"
+            pos="-0.01 0.25 0.72" rgba="0.10 0.10 0.10 1"/>
+      <geom name="right_armrest" type="box" size="0.20 0.06 0.018"
+            pos="-0.01 -0.25 0.72" rgba="0.10 0.10 0.10 1"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Optional wheel actuators. Set ctrl to wheel torque in your controller.
+         For initial passive viewing, simply do not send controls. -->
+    <motor name="left_drive" joint="left_wheel_joint"
+           gear="1" ctrllimited="false"/>
+    <motor name="right_drive" joint="right_wheel_joint"
+           gear="1" ctrllimited="false"/>
+  </actuator>
+
+  <sensor>
+    <jointpos name="left_wheel_angle" joint="left_wheel_joint"/>
+    <jointpos name="right_wheel_angle" joint="right_wheel_joint"/>
+    <jointvel name="left_wheel_speed" joint="left_wheel_joint"/>
+    <jointvel name="right_wheel_speed" joint="right_wheel_joint"/>
+  </sensor>
+</mujoco>

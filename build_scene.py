@@ -53,7 +53,61 @@ def build_spec() -> mujoco.MjSpec:
         if g.name not in ("floor", "wall"):
             g.contype = 0
             g.conaffinity = 0
+
+    add_joint_control(spec)
     return spec
+
+
+BASE_JOINTS = ("base_x", "base_y", "base_yaw")
+# Gripper: the URDF marks the second finger as a mimic of the first; MuJoCo
+# ignores <mimic>, so we recreate it as an equality constraint.
+GRIPPER_PAIRS = (("right_left_gripper", "right_right_gripper"),
+                 ("left_left_gripper", "left_right_gripper"))
+
+
+def add_joint_control(spec: mujoco.MjSpec, kp=30.0, kv=3.0):
+    """Make the model stable under mj_step and give every joint a position servo.
+
+    The URDF's inertials are placeholders (links of ~0.1 g), so without rotor
+    inertia and damping the integrator explodes. Armature + damping fix that;
+    position actuators let the viewer's Control sliders hold a pose.
+    """
+    followers = {b for _, b in GRIPPER_PAIRS}
+
+    def set_dof(joint, attr, value):
+        # Newer MuJoCo exposes joint damping/armature as 3-element arrays
+        # (one per possible DOF); older versions use a scalar.
+        try:
+            setattr(joint, attr, np.full(3, float(value)))
+        except TypeError:
+            setattr(joint, attr, float(value))
+
+    for j in spec.joints:
+        if j.name in BASE_JOINTS:
+            set_dof(j, "damping", 5.0)
+            set_dof(j, "armature", 0.5)
+            continue
+        set_dof(j, "armature", 0.02)
+        set_dof(j, "damping", 0.5)
+        if j.name in followers:
+            continue  # driven by the equality constraint below
+        act = spec.add_actuator()
+        act.name = f"act_{j.name}"
+        act.target = j.name
+        act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+        act.gainprm[0] = kp
+        act.biasprm[1] = -kp
+        act.biasprm[2] = -kv
+        act.ctrlrange[:] = j.range
+        act.ctrllimited = True
+
+    for leader, follower in GRIPPER_PAIRS:
+        eq = spec.add_equality()
+        eq.name = f"mimic_{follower}"
+        eq.type = mujoco.mjtEq.mjEQ_JOINT
+        eq.name1 = follower
+        eq.name2 = leader
+        eq.data[:5] = [0.0, 1.0, 0.0, 0.0, 0.0]  # follower = 0 + 1 * leader
 
 
 def joint_qpos_index(model, name):
