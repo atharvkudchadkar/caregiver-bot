@@ -28,6 +28,8 @@ Arrow keys (viewer window must have focus):
 import argparse
 import math
 import os
+import shutil
+import sys
 import time
 
 import mujoco
@@ -37,7 +39,7 @@ import numpy as np
 from camera_rig import CameraRig, load_config
 from vision_navigation import MapMemory, VisionNavigator
 
-WORLD = "world.xml"
+WORLD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "world.xml")
 GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82}
 SAVE_EVERY_S = 10.0
 
@@ -136,7 +138,7 @@ class Arms:
     """Position targets for the arm, lift and gripper servos.
 
     Joint names are the URDF's: rj0/lj0 (lift, metres), rj1..rj6 / lj1..lj6
-    (radians), plus 'gripper_right' / 'gripper_left' (0 open .. 1 closed),
+    (radians), plus 'gripper_right' / 'gripper_left' (0 closed .. 1 open),
     which drive both finger servos together.
     """
 
@@ -236,6 +238,19 @@ def main():
         ap.error(f"unknown room {room!r}; rooms with signs: {rooms}")
     if args.goal and not np.isfinite(args.goal).all():
         ap.error("goal coordinates must be finite")
+
+    if sys.platform == "darwin" and not args.headless and os.environ.get("_CAREGIVER_MJPYTHON") != "1":
+        launcher = shutil.which("mjpython")
+        if launcher is None:
+            ap.error("interactive MuJoCo viewing on macOS requires mjpython; install it with mujoco")
+        env = os.environ.copy()
+        env["_CAREGIVER_MJPYTHON"] = "1"
+        os.execvpe(launcher, [launcher, os.path.abspath(__file__), *sys.argv[1:]], env)
+
+    if args.world == WORLD and not os.path.isfile(WORLD):
+        from build_world import build
+        print("world.xml is missing; generating it from the robot and wheelchair models")
+        build()
 
     model = mujoco.MjModel.from_xml_path(args.world)
     data = mujoco.MjData(model)

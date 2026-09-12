@@ -3,6 +3,7 @@ __pycache__/
 *.png
 assets/markers/
 memory/
+!assets/wheelchair_aruco_4x4_50_id0.png
 robot_converted.xml
 scene.xml
 world.xml
