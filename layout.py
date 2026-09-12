@@ -7,9 +7,13 @@ onto the hallway. In the original wall coordinates the hallway walls were
 continuous and the "doorway" segments overlapped, so no room was reachable.
 """
 
-WALL_HALF_T = 0.075       # 15 cm thick walls
-WALL_HALF_H = 0.6         # 1.2 m tall: you can see into rooms from the overview camera
+WALL_HALF_T = 0.075 * 1.5   # 15 cm thick walls, scaled up 1.5x
+WALL_HALF_H = 0.6 * 1.5     # 1.2 m tall (scaled 1.5x): see into rooms from the overview camera
 DOOR_W = 1.2
+
+# Direct pathway between the bedroom and kitchen, in addition to the hallway.
+BRIDGE_Y = 2.0
+BRIDGE_W = DOOR_W
 HALL_X = (-6.0, 6.0)      # hallway runs east-west along y = 0
 HALL_Y = (-0.75, 0.75)
 
@@ -90,6 +94,7 @@ FURN_COLOR = dict(
     # channel spread) from the near-neutral-gray floor colour classifier in
     # vision_navigation.py, so they never get mistaken for walkable floor.
     porcelain=(0.95, 0.92, 0.83, 1), linen=(0.92, 0.87, 0.75, 1),
+    terracotta=(0.72, 0.42, 0.3, 1), leaf=(0.22, 0.5, 0.24, 1),
 )
 
 
@@ -101,20 +106,25 @@ def _cyl(name, pos, size, color):
     return dict(name=name, type="cylinder", pos=tuple(pos), size=tuple(size), rgba=FURN_COLOR[color])
 
 
+def _sphere(name, pos, radius, color):
+    return dict(name=name, type="sphere", pos=tuple(pos), size=(radius,), rgba=FURN_COLOR[color])
+
+
 def furniture():
     """name -> list of primitive geom specs (pos/size are half-extents, metres)."""
     items = {}
 
     # Bedroom: a bed against the far (north) wall, east of the door and both
-    # spawns, plus a nightstand at its head.
+    # spawns, plus a nightstand at its head. Sized/placed to stay clear of the
+    # bedroom/kitchen bridge doorway (BRIDGE_Y +/- BRIDGE_W/2 on the east wall).
     r = ROOMS["bedroom"]
     bx = r["x"][1] - 0.7                       # east side, clear of the door lane
-    by = far_wall_y("bedroom") - 0.075 - 0.85 - 0.05
+    by = far_wall_y("bedroom") - WALL_HALF_T - 0.32 - 0.05
     items["bedroom"] = [
-        _box("bed_frame", (bx, by, 0.12), (0.5, 0.85, 0.12), "wood_dark"),
-        _box("bed_mattress", (bx, by, 0.32), (0.45, 0.8, 0.08), "linen"),
-        _box("bed_pillow", (bx, by + 0.65, 0.45), (0.3, 0.15, 0.05), "linen"),
-        _box("nightstand", (bx - 0.75, by + 0.65, 0.25), (0.2, 0.2, 0.25), "wood"),
+        _box("bed_frame", (bx, by, 0.12), (0.4, 0.32, 0.12), "wood_dark"),
+        _box("bed_mattress", (bx, by, 0.32), (0.35, 0.28, 0.08), "linen"),
+        _box("bed_pillow", (bx, by + 0.2, 0.45), (0.25, 0.08, 0.05), "linen"),
+        _box("nightstand", (bx - 0.75, by + 0.1, 0.25), (0.2, 0.2, 0.25), "wood"),
     ]
 
     # Kitchen: three counter/cabinet units along the far wall, a table with
@@ -154,6 +164,17 @@ def furniture():
         _cyl("toilet_bowl", (tx, bowl_y, 0.19), (0.19, 0.19), "porcelain"),
         _box("toilet_seat", (tx, bowl_y, 0.4), (0.19, 0.22, 0.02), "porcelain"),
     ]
+
+    # A potted plant halfway along the bedroom<->kitchen bridge corridor,
+    # centred on the walkway but small enough to leave clearance on both
+    # sides (corridor half-width 0.6 m vs. plant radius 0.25 m).
+    plant_x = (ROOMS["bedroom"]["x"][1] + ROOMS["kitchen"]["x"][0]) / 2
+    items["bridge"] = [
+        _cyl("plant_pot", (plant_x, BRIDGE_Y, 0.15), (0.15, 0.15), "terracotta"),
+        _sphere("plant_foliage_1", (plant_x, BRIDGE_Y, 0.55), 0.22, "leaf"),
+        _sphere("plant_foliage_2", (plant_x - 0.08, BRIDGE_Y + 0.05, 0.68), 0.15, "leaf"),
+        _sphere("plant_foliage_3", (plant_x + 0.1, BRIDGE_Y - 0.06, 0.62), 0.16, "leaf"),
+    ]
     return items
 
 
@@ -172,11 +193,24 @@ def wall_segments():
         segs.append((f"{tag}_{len(doors)}", x, y, hx1, y))
     segs.append(("hall_west", hx0, hy0, hx0, hy1))
     segs.append(("hall_east", hx1, hy0, hx1, hy1))
+    gy0, gy1 = BRIDGE_Y - BRIDGE_W / 2, BRIDGE_Y + BRIDGE_W / 2
     for name, r in ROOMS.items():
         x0, x1 = r["x"]
         y0, y1 = r["y"]
-        segs.append((f"{name}_west", x0, y0, x0, y1))
-        segs.append((f"{name}_east", x1, y0, x1, y1))
+        if name == "bedroom":       # doorway to the bedroom/kitchen bridge
+            segs.append((f"{name}_east_0", x1, y0, x1, gy0))
+            segs.append((f"{name}_east_1", x1, gy1, x1, y1))
+        else:
+            segs.append((f"{name}_east", x1, y0, x1, y1))
+        if name == "kitchen":       # doorway to the bedroom/kitchen bridge
+            segs.append((f"{name}_west_0", x0, y0, x0, gy0))
+            segs.append((f"{name}_west_1", x0, gy1, x0, y1))
+        else:
+            segs.append((f"{name}_west", x0, y0, x0, y1))
         far_y = y1 if is_north(name) else y0
         segs.append((f"{name}_far", x0, far_y, x1, far_y))
+    # Corridor walls joining the two doorways directly.
+    bx0, bx1 = ROOMS["bedroom"]["x"][1], ROOMS["kitchen"]["x"][0]
+    segs.append(("bridge_north", bx0, gy1, bx1, gy1))
+    segs.append(("bridge_south", bx0, gy0, bx1, gy0))
     return segs
