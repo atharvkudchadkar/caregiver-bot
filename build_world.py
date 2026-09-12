@@ -19,6 +19,7 @@ import os
 import xml.etree.ElementTree as ET
 
 import layout
+from camera_rig import load_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROBOT_XML = os.path.join(HERE, "mujoco", "balance_robot.xml")
@@ -75,20 +76,51 @@ def make_robot_solid(base):
                   fromto="0.01 0 0.25 0.01 0 1.55", size="0.06", **common)
 
 
-def add_lidar(base, sensor):
-    """Nine rangefinder beams fanned across the front at layout.RF_HEIGHT.
-    A rangefinder ignores geoms of the body its site sits on (the base), so
-    the beams see walls, the wheelchair and obstacles, not the robot."""
-    for i, deg in enumerate(layout.RF_ANGLES_DEG):
-        a = math.radians(deg)
-        ET.SubElement(base, "site", name=f"rf_{i}", pos=fmt(0.12, 0, layout.RF_HEIGHT),
-                      zaxis=fmt(math.cos(a), math.sin(a), 0), size="0.01",
-                      rgba="0 1 0 0.3", group="3")
-        ET.SubElement(sensor, "rangefinder", name=f"rf_{i}", site=f"rf_{i}",
-                      cutoff=fmt(layout.RF_CUTOFF))
+def add_cameras(base, config):
+    """Calibrate home mounts into each link's local frame; wrists then articulate."""
+    import mujoco
+    import numpy as np
+    model = mujoco.MjModel.from_xml_path(ROBOT_XML)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    for camera in config["cameras"]:
+        body = base if camera["body"] == "mobile_base" else base.find(f".//body[@name='{camera['body']}']")
+        bid = model.body(camera["body"]).id
+        rotation = data.xmat[bid].reshape(3, 3)
+        yaw, pitch = map(math.radians, (camera["yaw_deg"], camera["pitch_deg"]))
+        right = np.array([math.sin(yaw), -math.cos(yaw), 0])
+        up = np.array([math.sin(pitch)*math.cos(yaw), math.sin(pitch)*math.sin(yaw), math.cos(pitch)])
+        ET.SubElement(body, "camera", name=camera["name"],
+                      pos=fmt(*(rotation.T @ camera["offset"])),
+                      xyaxes=fmt(*(rotation.T @ right), *(rotation.T @ up)), fovy=str(config["fovy"]))
 
 
-def build(obstacle=False):
+def add_room_labels(asset, wb, config):
+    """Physical floor labels: ID-to-name is known, their locations are not."""
+    import cv2
+    import numpy as np
+    directory = os.path.join(HERE, "assets", "markers")
+    os.makedirs(directory, exist_ok=True)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    for marker_id, room in config["marker_rooms"].items():
+        if room not in layout.ROOMS:
+            continue
+        image = np.full((256, 256), 255, np.uint8)
+        image[32:224, 32:224] = cv2.aruco.generateImageMarker(dictionary, int(marker_id), 192)
+        filename = f"room_{marker_id}.png"
+        cv2.imwrite(os.path.join(directory, filename), image)
+        name = f"label_{marker_id}"
+        ET.SubElement(asset, "texture", name=name, type="2d", file=f"assets/markers/{filename}")
+        ET.SubElement(asset, "material", name=name, texture=name, texrepeat="1 1", texuniform="false")
+        x, y = layout.room_center(room)
+        bounds = layout.ROOMS[room]["y"]
+        y = bounds[1] - 0.45 if layout.is_north(room) else bounds[0] + 0.45
+        ET.SubElement(wb, "geom", name=name, type="plane", pos=fmt(x, y, 0.003),
+                      size="0.25 0.25 0.001", material=name, contype="0", conaffinity="0")
+
+
+def build(obstacle=False, config_path=None):
+    config = load_config(config_path)
     robot = ET.parse(ROBOT_XML).getroot()
     wc = ET.parse(WHEELCHAIR_XML).getroot()
 
@@ -139,24 +171,17 @@ def build(obstacle=False):
         ET.SubElement(wb, "geom", {"class": "wall"}, name=f"wall_{name}",
                       pos=fmt(cx, cy, layout.WALL_HALF_H), size=fmt(*size))
 
-    # Room markers (sites double as navigation targets you can read from the model).
-    for name, r in layout.ROOMS.items():
-        cx, cy = layout.room_center(name)
-        ET.SubElement(wb, "site", name=name, type="cylinder", pos=fmt(cx, cy, 0.01),
-                      size="0.3 0.005", rgba=fmt(*r["color"], 0.7))
+    add_room_labels(asset, wb, config)
 
     # Robot: the whole mobile_base subtree, plus a forward-looking head camera.
     base = copy.deepcopy(robot.find("worldbody/body[@name='mobile_base']"))
     sp = layout.SPAWN["robot"]
     base.set("pos", fmt(*sp["pos"]))
     base.set("quat", yaw_quat(sp["yaw_deg"]))
-    # camera looks along +x (forward), tilted 15 deg down, from the top of the mast
-    ET.SubElement(base, "camera", name="head_cam", pos="0.08 0 1.5",
-                  xyaxes=fmt(0, -1, 0, math.sin(math.radians(15)), 0, math.cos(math.radians(15))),
-                  fovy="70")
+    add_cameras(base, config)
     make_robot_solid(base)
     sensor = ET.Element("sensor")          # appended to root below
-    add_lidar(base, sensor)
+    ET.SubElement(sensor, "framequat", name="base_orientation", objtype="body", objname="mobile_base")
     wb.append(base)
 
     # Wheelchair: prefixed so its joint names don't collide with the robot's wheels.
@@ -196,9 +221,10 @@ def main():
     ap = argparse.ArgumentParser(description="Compose world.xml")
     ap.add_argument("--obstacle", action="store_true",
                     help="drop a crate in the hallway to test obstacle avoidance")
+    ap.add_argument("--vision-config", help="camera calibration and room label configuration")
     args = ap.parse_args()
 
-    out = build(obstacle=args.obstacle)
+    out = build(obstacle=args.obstacle, config_path=args.vision_config)
     import mujoco
     model = mujoco.MjModel.from_xml_path(out)
     print(f"wrote {out}" + ("  (with hallway obstacle)" if args.obstacle else ""))

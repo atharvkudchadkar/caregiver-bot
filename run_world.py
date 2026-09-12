@@ -1,7 +1,7 @@
 """Run the caregiver world: balancing robot that accepts (v, w) drive commands.
 
   python run_world.py                          viewer; arrow keys drive, space stops
-  python run_world.py --goto kitchen           autonomous route to a room
+  python run_world.py --goto kitchen           explore for the kitchen label
   python run_world.py --goto bathroom --headless --seconds 90
   python run_world.py --joint rj1=0.4 --joint rj0=-0.3 --joint gripper_right=0.8
 
@@ -10,10 +10,10 @@ body frame so it works at any heading and adds differential torque for
 steering. Everything upstream (voice -> intent -> nav) only ever calls
 BalanceBase.command(v, w); the real Bracket Bot gets the same call.
 
-Obstacle avoidance is reactive: nine simulated lidar beams (rangefinder
-sensors added by build_world.py) slow the robot near things, steer it toward
-the freer side, and stop-and-turn when the front is blocked. It is not a
-planner; it gets past a crate in a hallway, not through a maze.
+Navigation consumes three RGB cameras, wheel encoders and IMU tilt. It builds
+an observed free-space map and plans online, with no apartment coordinates or
+simulator base pose passed to the navigator. Room names refer to visible floor
+labels; unseen destinations require exploration.
 
 Arrow keys (viewer window must have focus):
   up/down     +/- 0.1 m/s forward speed      left/right   +/- 0.3 rad/s turn rate
@@ -27,7 +27,8 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-import layout
+from camera_rig import CameraRig, load_config
+from vision_navigation import VisionNavigator
 
 WORLD = "world.xml"
 GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82}
@@ -170,100 +171,6 @@ class Arms:
             self.d.ctrl[aid] += float(np.clip(delta, -step, step))
 
 
-class Lidar:
-    """Reads the rangefinder fan added by build_world.py."""
-
-    def __init__(self, model, data):
-        self.m, self.d = model, data
-        self.angles = np.radians(layout.RF_ANGLES_DEG)
-        self.adr = [model.sensor_adr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, f"rf_{i}")]
-                    for i in range(len(layout.RF_ANGLES_DEG))]
-
-    def ranges(self):
-        r = np.array([self.d.sensordata[a] for a in self.adr])
-        r[r < 0] = layout.RF_CUTOFF          # -1 means nothing within cutoff
-        return r
-
-    def sectors(self, front_deg=30):
-        r = self.ranges()
-        deg = np.degrees(self.angles)
-        front = r[np.abs(deg) <= front_deg].min()
-        left = r[deg > 0].min()
-        right = r[deg < 0].min()
-        return front, left, right
-
-
-class Navigator:
-    """Follows waypoints, with reactive obstacle avoidance from the lidar.
-
-    States: NAV (P-controller to the waypoint), AVOID_TURN (front blocked:
-    rotate toward the freer side until clear), AVOID_COMMIT (drive straight
-    for a moment so we actually clear the obstacle before resuming NAV).
-    """
-
-    STOP, SLOW = 0.45, 0.9            # metres
-    COMMIT_S = 1.5
-
-    def __init__(self, waypoints, lidar=None):
-        self.waypoints = list(waypoints)
-        self.i = 0
-        self.lidar = lidar
-        self.state = "NAV"
-        self.turn_dir = 1.0
-        self.commit_until = 0.0
-
-    @property
-    def done(self):
-        return self.i >= len(self.waypoints)
-
-    def _nav_cmd(self, base):
-        v, w, arrived = layout.step_toward(base.pose(), self.waypoints[self.i])
-        if arrived:
-            self.i += 1
-            if self.done:
-                return 0.0, 0.0
-            v, w, _ = layout.step_toward(base.pose(), self.waypoints[self.i])
-        return v, w
-
-    def update(self, base, sim_time=0.0):
-        if self.done:
-            base.stop()
-            return
-        if self.lidar is None:
-            base.command(*self._nav_cmd(base))
-            return
-
-        front, left, right = self.lidar.sectors()
-        if self.state == "AVOID_TURN":
-            if front > self.SLOW:
-                self.state = "AVOID_COMMIT"
-                self.commit_until = sim_time + self.COMMIT_S
-            base.command(0.0, 0.5 * self.turn_dir)
-            return
-        if self.state == "AVOID_COMMIT":
-            if front < self.STOP:
-                self.state = "AVOID_TURN"
-                self.turn_dir = 1.0 if left > right else -1.0
-            elif sim_time > self.commit_until:
-                self.state = "NAV"
-            # drift toward the roomier side while committing, if there is one
-            w = 0.3 * np.sign(left - right) if abs(left - right) > 0.3 else 0.0
-            base.command(0.2, w)
-            return
-
-        v, w = self._nav_cmd(base)
-        if front < self.STOP:
-            self.state = "AVOID_TURN"
-            self.turn_dir = 1.0 if left > right else -1.0
-            base.command(0.0, 0.0)
-            return
-        if front < self.SLOW:
-            k = (front - self.STOP) / (self.SLOW - self.STOP)      # 0 at STOP .. 1 at SLOW
-            v = min(v, 0.05 + 0.25 * k)
-            w += 0.5 * (1.0 - k) * np.sign(left - right)          # lean toward the freer side
-        base.command(v, w)
-
-
 def reset(model, data, base):
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
@@ -275,58 +182,71 @@ def reset(model, data, base):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--world", default=WORLD)
-    ap.add_argument("--goto", metavar="ROOM", help=f"drive to one of {list(layout.ROOMS)}")
+    goals = ap.add_mutually_exclusive_group()
+    goals.add_argument("--goto", metavar="ROOM", help="find a room by its visible floor label")
+    goals.add_argument("--goal", nargs=2, type=float, metavar=("X", "Y"),
+                       help="goal in metres relative to startup pose, x forward, y left")
+    goals.add_argument("--explore", action="store_true", help="explore visible free space")
+    ap.add_argument("--vision-config", help="camera and perception calibration JSON")
+    ap.add_argument("--camera-preview", action="store_true", help="show all three RGB feeds and floor masks")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--seconds", type=float, default=60.0, help="headless run time")
     ap.add_argument("--joint", action="append", default=[], metavar="NAME=VALUE",
-                    help="arm/lift/gripper target, repeatable (e.g. rj1=0.4, gripper_right=0.8)")
-    ap.add_argument("--no-avoid", action="store_true", help="disable lidar obstacle avoidance")
+                    help="arm/lift/gripper target, repeatable")
     args = ap.parse_args()
-
+    config = load_config(args.vision_config)
+    room = args.goto.lower().strip().replace(" ", "_") if args.goto else None
+    if room and room not in config["marker_rooms"].values():
+        ap.error(f"unknown room {room!r}; labels: {list(config['marker_rooms'].values())}")
+    if args.goal and not np.isfinite(args.goal).all():
+        ap.error("goal coordinates must be finite")
     model = mujoco.MjModel.from_xml_path(args.world)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    base = BalanceBase(model, data)
-    arms = Arms(model, data)
-    lidar = None if args.no_avoid else Lidar(model, data)
-
+    base, arms = BalanceBase(model, data), Arms(model, data)
     for entry in args.joint:
         name, _, value = entry.partition("=")
         arms.set(name.strip(), float(value))
-
-    nav = None
-    if args.goto:
-        room = layout.canonical_room(args.goto) or args.goto
-        path = layout.route(base.pose()[:2], room)
-        print(f"route to {room}: " + " -> ".join(f"({x:.1f}, {y:.1f})" for x, y in path))
-        nav = Navigator(path, lidar)
+    rig = CameraRig(model, config)
+    nav = VisionNavigator(config, room=room, goal=args.goal)
+    autonomous = bool(room or args.goal is not None or args.explore)
+    state = None
+    print("RGB navigation: head + left hand + right hand; local wheel odometry; no preset routes")
 
     def control_tick():
-        if not base.fallen:
-            if nav is not None:
-                nav.update(base, data.time)
-            elif lidar is not None and base.v_cmd > 0:
-                front, _, _ = lidar.sectors()
-                if front < Navigator.STOP:           # teleop safety stop
-                    base.command(0.0, base.w_cmd)
-                    print("obstacle ahead: stopped")
+        nonlocal state
+        pose, frames = rig.sample(data)
+        if frames is not None:
+            nav.observe(frames, pose)
+            if not base.fallen:
+                if autonomous:
+                    base.command(*nav.command(pose, data.time))
+                else:
+                    base.command(*nav.guard(pose, data.time, base.v_cmd, base.w_cmd))
+            if autonomous and nav.state != state:
+                state = nav.state
+                print(f"t={data.time:.1f}s {state} odom=({pose[0]:.2f}, {pose[1]:.2f}) "
+                      f"labels={list(nav.map.targets)}", flush=True)
+            if args.camera_preview:
+                import cv2
+                previews = []
+                for frame in frames:
+                    rgb = frame.rgb.copy()
+                    mask = nav.vision.masks.get(frame.name, np.zeros(rgb.shape[:2], np.uint8))
+                    rgb[mask > 0] = (rgb[mask > 0].astype(float)*0.65 + np.array([0, 90, 0])).clip(0, 255)
+                    cv2.putText(rgb, frame.name, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                    previews.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                cv2.imshow("Robot RGB cameras - green: estimated floor", np.hstack(previews))
+                cv2.waitKey(1)
+        if data.time - nav.last_frame > 0.5:
+            base.stop()
         arms.step()
         base.step()
 
-    if args.headless:
-        n = int(args.seconds / model.opt.timestep)
-        for _ in range(n):
-            control_tick()
-            if base.fallen or (nav is not None and nav.done):
-                break
-        x, y, yaw = base.pose()
-        print(f"t={data.time:.1f}s pose=({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f} deg) "
-              f"pitch={math.degrees(base.pitch()):.1f} deg fallen={base.fallen} "
-              f"{'arrived' if nav is not None and nav.done else ''}")
-        return
-
     def on_key(keycode):
-        nonlocal nav
+        nonlocal autonomous, nav
+        if keycode in (GLFW_KEYS[k] for k in ("up", "down", "left", "right", "space", "r")):
+            autonomous = False
         if keycode == GLFW_KEYS["up"]:
             base.command(base.v_cmd + 0.1, base.w_cmd)
         elif keycode == GLFW_KEYS["down"]:
@@ -336,35 +256,48 @@ def main():
         elif keycode == GLFW_KEYS["right"]:
             base.command(base.v_cmd, base.w_cmd - 0.3)
         elif keycode == GLFW_KEYS["space"]:
-            nav = None
             base.stop()
         elif keycode == GLFW_KEYS["r"]:
-            nav = None
             reset(model, data, base)
+            rig.reset()
+            nav = VisionNavigator(config)
         else:
             return
         print(f"cmd v={base.v_cmd:+.1f} m/s  w={base.w_cmd:+.1f} rad/s")
 
-    steps_per_frame = 10
-    with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as viewer:
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        viewer.cam.trackbodyid = base.base_id
-        viewer.cam.distance, viewer.cam.elevation, viewer.cam.azimuth = 4.5, -25, 135
-        announced = False
-        while viewer.is_running():
-            t0 = time.monotonic()
-            for _ in range(steps_per_frame):
+    try:
+        if args.headless:
+            for _ in range(int(args.seconds / model.opt.timestep)):
                 control_tick()
-            viewer.sync()
-            if base.fallen and not announced:
-                print("fell over: press r to reset")
-                announced = True
-            if nav is not None and nav.done and not announced:
-                print("arrived")
-                announced = True
-            remaining = steps_per_frame * model.opt.timestep - (time.monotonic() - t0)
-            if remaining > 0:
-                time.sleep(remaining)
+                if base.fallen or (autonomous and (nav.done or nav.state == "BLOCKED")):
+                    break
+            x, y, yaw = rig.odom.pose
+            print(f"t={data.time:.1f}s odom=({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f} deg) "
+                  f"pitch={math.degrees(base.pitch()):.1f} deg fallen={base.fallen} "
+                  f"navigation={nav.state}")
+            return
+        steps_per_frame = 10
+        with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as viewer:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            viewer.cam.trackbodyid = base.base_id
+            viewer.cam.distance, viewer.cam.elevation, viewer.cam.azimuth = 4.5, -25, 135
+            announced = False
+            while viewer.is_running():
+                t0 = time.monotonic()
+                for _ in range(steps_per_frame):
+                    control_tick()
+                viewer.sync()
+                if base.fallen and not announced:
+                    print("fell over: press r to reset")
+                    announced = True
+                remaining = steps_per_frame * model.opt.timestep - (time.monotonic() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
+    finally:
+        rig.close()
+        if args.camera_preview:
+            import cv2
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

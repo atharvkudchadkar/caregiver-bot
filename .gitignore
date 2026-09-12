@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.png
+assets/markers/
 robot_converted.xml
 scene.xml
 world.xml

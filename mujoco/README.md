@@ -1,5 +1,9 @@
 # Two-wheel robot balance demo (MuJoCo)
 
+For the apartment simulation with three-camera navigation, see the root
+[README](../README.md) and run `build_world.py` / `run_world.py` from the root.
+This document describes only the standalone balance demo in this folder.
+
 A simulation of the robot from `chopped_urdf_v2`, with two driven wheels, a Python balance controller, and scripted targets for both arms and grippers. The model and mesh files are included; no external mesh paths are needed.
 
 ## Set up
