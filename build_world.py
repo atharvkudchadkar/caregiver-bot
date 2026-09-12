@@ -6,7 +6,7 @@ Then:  python run_world.py                 (viewer, arrow-key teleop)
        python -m mujoco.viewer --mjcf world.xml   (passive look, no controller)
 
 Sources merged:
-  mujoco/balance_robot.xml   teammate's robot with wheel motors + arm servos
+  balance_robot_with_cameras.xml   robot with wheel motors, arm servos, and cameras
   assets/wheelchair.xml      teammate's wheelchair (renamed with a wc_ prefix)
   layout.py                  room/hallway geometry (walls generated here)
 
@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 import layout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROBOT_XML = os.path.join(HERE, "mujoco", "balance_robot.xml")
+ROBOT_XML = os.path.join(HERE, "balance_robot_with_cameras.xml")
 WHEELCHAIR_XML = os.path.join(HERE, "assets", "wheelchair.xml")
 OUT = os.path.join(HERE, "world.xml")
 WC_PREFIX = "wc_"
@@ -93,7 +93,7 @@ def build(obstacle=False):
     wc = ET.parse(WHEELCHAIR_XML).getroot()
 
     root = ET.Element("mujoco", model="caregiver_world")
-    # Mesh entries in balance_robot.xml are written as file="meshes/X.stl",
+    # Robot mesh entries are written as file="meshes/X.stl",
     # so meshdir points at the folder that contains "meshes/".
     ET.SubElement(root, "compiler", angle="radian", meshdir="mujoco", autolimits="true")
     ET.SubElement(root, "option", timestep="0.002")
@@ -145,15 +145,11 @@ def build(obstacle=False):
         ET.SubElement(wb, "site", name=name, type="cylinder", pos=fmt(cx, cy, 0.01),
                       size="0.3 0.005", rgba=fmt(*r["color"], 0.7))
 
-    # Robot: the whole mobile_base subtree, plus a forward-looking head camera.
+    # Robot: the whole mobile_base subtree, including its head and hand cameras.
     base = copy.deepcopy(robot.find("worldbody/body[@name='mobile_base']"))
     sp = layout.SPAWN["robot"]
     base.set("pos", fmt(*sp["pos"]))
     base.set("quat", yaw_quat(sp["yaw_deg"]))
-    # camera looks along +x (forward), tilted 15 deg down, from the top of the mast
-    ET.SubElement(base, "camera", name="head_cam", pos="0.08 0 1.5",
-                  xyaxes=fmt(0, -1, 0, math.sin(math.radians(15)), 0, math.cos(math.radians(15))),
-                  fovy="70")
     make_robot_solid(base)
     sensor = ET.Element("sensor")          # appended to root below
     add_lidar(base, sensor)
