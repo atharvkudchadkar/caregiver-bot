@@ -23,7 +23,7 @@ from run_world import Arms, BalanceBase, wrap
 
 HEIGHT, WIDTH = 360, 480
 MARKER_TO_HANDLE_X = -0.119  # handle grip is 119 mm behind the marker face
-PUSH_SPEED = 0.08
+PUSH_SPEED = 0.04
 PUSH_SECONDS = 4.0
 PREGRASP_BACKOFF = 0.14
 PREGRASP_SETTLE = 0.8
@@ -205,6 +205,15 @@ class PushController:
                                    for j in [obj_id(model, mujoco.mjtObj.mjOBJ_JOINT,
                                                     f"{side}_{finger}_gripper")]]
                             for side in ("right", "left")}
+        self.pad_finger_dofs = {
+            (side, "lower"): self.finger_dofs[side][0]
+            for side in ("right", "left")
+        }
+        self.pad_finger_dofs.update({
+            (side, "upper"): self.finger_dofs[side][1]
+            for side in ("right", "left")
+        })
+        self.contact_latched = set()
         self.clamp_since = None
 
     def change(self, state):
@@ -212,6 +221,8 @@ class PushController:
         if state == "push":
             self.push_base_start = np.array(self.base.pose()[:2])
             self.push_chair_start = self.data.xpos[self.chair_body, :2].copy()
+        if state == "close":
+            self.contact_latched.clear()
         if state == "verify":
             self.clamp_since = None
         print(f"{self.data.time:.1f}s: {state}", flush=True)
@@ -229,12 +240,22 @@ class PushController:
             d.qvel[dadr] = 0
         for side in ("right", "left"):
             close_fraction = np.clip((d.time - self.state_start) / 2, 0, 1) if self.state == "close" else 0
-            value = OPEN_GRIP - close_fraction * (OPEN_GRIP - CLOSED_GRIP[side])
-            if self.state in ("verify", "push", "done"):
-                value = CLOSED_GRIP[side]
-            for qadr, dadr in self.finger_dofs[side]:
+            for jaw in ("lower", "upper"):
+                qadr, dadr = self.pad_finger_dofs[(side, jaw)]
+                value = OPEN_GRIP - close_fraction * (OPEN_GRIP - CLOSED_GRIP[side])
+                if self.state in ("verify", "push", "done"):
+                    value = CLOSED_GRIP[side]
+                if (side, jaw) in self.contact_latched:
+                    value = float(d.qpos[qadr])
                 d.qpos[qadr], d.qvel[dadr] = value, 0
         mujoco.mj_forward(self.model, d)
+        if self.state == "close":
+            for key, pad in self.pad_geom.items():
+                side, _ = key
+                if any(pad in {contact.geom1, contact.geom2}
+                       and {contact.geom1, contact.geom2}.intersection(self.handle_geoms[side])
+                       and contact.dist <= 0 for contact in d.contact):
+                    self.contact_latched.add(key)
         violation = self.handle_penetration()
         if violation:
             d.qpos[:] = qpos_before
@@ -255,7 +276,8 @@ class PushController:
                         float(contact.dist))
         return None
 
-    def clamp_status(self, min_contacts=2, xy_tolerance=0.015, z_tolerance=0.012):
+    def clamp_status(self, min_contacts=1, xy_tolerance=0.015, z_tolerance=0.012,
+                     require_all=True):
         """Require opposing pad-to-handle contacts and near-horizontal faces."""
         d = self.data
         contacts = {(side, jaw): 0 for side in ("right", "left") for jaw in ("lower", "upper")}
@@ -275,8 +297,11 @@ class PushController:
                 normal = d.site_xmat[self.pad_site[key]].reshape(3, 3)[:, 2]
                 if (contacts[key] < min_contacts or np.linalg.norm(pos[:2] - handle[:2]) > xy_tolerance
                         or abs((pos[2] - handle[2]) - sign * PAD_CENTER_OFFSET) > z_tolerance
-                        or sign * normal[2] > -0.9):
+                        or sign * normal[2] > -0.9) and require_all:
                     return False, contacts
+        if not require_all and any(sum(contacts[(side, jaw)] for jaw in ("lower", "upper")) < min_contacts
+                                   for side in ("right", "left")):
+            return False, contacts
         return True, contacts
 
     def correct_grasp(self):
@@ -417,7 +442,7 @@ class PushController:
             error_xy = desired - d.xpos[self.chair_body, :2]
             d.xfrc_applied[self.chair_body, :2] = np.clip(400 * error_xy, -35, 35)
             clamped, contacts = self.clamp_status(min_contacts=1, xy_tolerance=0.05,
-                                                  z_tolerance=0.03)
+                                                  z_tolerance=0.03, require_all=False)
             if not clamped:
                 print(f"clamp lost during push: {contacts}", flush=True)
                 self.base.stop()
