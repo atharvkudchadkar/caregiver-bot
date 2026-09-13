@@ -86,16 +86,6 @@ def make_robot_solid(base):
     # fatter than the real fingers and would tunnel the handle. The jaw pads
     # added below are the clamp surfaces.
 
-def add_lidar(base, sensor):
-        """Add the front rangefinder beams used by obstacle avoidance."""
-        for i, deg in enumerate(layout.RF_ANGLES_DEG):
-                angle = math.radians(deg)
-                ET.SubElement(base, "site", name=f"rf_{i}", pos=fmt(0.12, 0, layout.RF_HEIGHT),
-                                            zaxis=fmt(math.cos(angle), math.sin(angle), 0), size="0.01",
-                                            rgba="0 1 0 0.3", group="3")
-                ET.SubElement(sensor, "rangefinder", name=f"rf_{i}", site=f"rf_{i}",
-                                            cutoff=fmt(layout.RF_CUTOFF))
-
 def add_cameras(base, config):
     """Calibrate home mounts into each link's local frame; wrists then articulate."""
     import mujoco
@@ -180,7 +170,9 @@ def build(obstacle=False, config_path=None):
     # Robot mesh entries are written as file="meshes/X.stl",
     # so meshdir points at the folder that contains "meshes/".
     ET.SubElement(root, "compiler", angle="radian", meshdir="mujoco", autolimits="true")
-    ET.SubElement(root, "option", timestep="0.002")
+    ET.SubElement(root, "option", timestep="0.002", iterations="80",
+                  tolerance="1e-8", integrator="implicitfast")
+    ET.SubElement(root, "size", nconmax="400", njmax="2000")
     visual = ET.SubElement(root, "visual")
     ET.SubElement(visual, "global", offwidth="1280", offheight="720")
     ET.SubElement(visual, "headlight", ambient="0.45 0.45 0.45", diffuse="0.6 0.6 0.6")
@@ -256,10 +248,10 @@ def build(obstacle=False, config_path=None):
          "-0.70157 -0.02082 0.71229 0.70952 0.07235 0.70096"),
         ("right", "upper", "right_finger__right_finger", "0.0437 0.0053 0.0313",
          "0.70165 -0.01815 -0.71229 0.70979 -0.06966 0.70096"),
-        ("left", "lower", "l_left_finger__left_finger", "0.0536 -0.0087 0.0201",
-         "0.57682 -0.33612 -0.74451 0.36424 -0.70996 0.60273"),
-        ("left", "upper", "l_right_finger__right_finger", "-0.0249 0.0066 -0.0031",
-         "-0.64231 0.18204 0.74451 0.76395 0.23045 0.60273"),
+        ("left", "lower", "l_left_finger__left_finger", "0.0430 -0.0067 0.0295",
+         "0.65333 -0.25651 -0.71229 0.68089 -0.21224 0.70096"),
+        ("left", "upper", "l_right_finger__right_finger", "-0.0423 0.0123 -0.0313",
+         "-0.63809 0.29238 0.71229 0.62533 -0.34295 0.70096"),
     )
     pad_contact = dict(type="box", size="0.022 0.016 0.006",
                        rgba="0.10 0.10 0.12 1", mass="0.001",
@@ -274,7 +266,6 @@ def build(obstacle=False, config_path=None):
                       xyaxes=xyaxes, size="0.003", rgba="1 0.6 0 1")
     sensor = ET.Element("sensor")   # appended to root below
     ET.SubElement(sensor, "framequat", name="base_orientation", objtype="body", objname="mobile_base")
-    add_lidar(base, sensor)
     wb.append(base)
 
     # Wheelchair: prefixed so its joint names don't collide with the robot's wheels.
@@ -284,20 +275,34 @@ def build(obstacle=False, config_path=None):
     chair.set("pos", fmt(*sp["pos"]))
     chair.set("quat", yaw_quat(sp["yaw_deg"]))
     chair.set("childclass", "wheelchair")
-    # Jaw pads (bit 16) meet the flat handle plates (bit 8). The rest of the
-    # chair stays out of the arm path so a reach does not snag the backrest.
+    # Jaw pads (bit 16) meet the flat handle plates (bit 8). Handles also
+    # accept world contacts (bit 1) so the chair cannot ghost through a wall.
+    # The rest of the chair keeps the class mask (world/base/arms, not itself).
     handle_names = {f"wc_{side}_{part}" for side in ("left", "right")
                     for part in ("push_handle", "handle_grip", "handle_tip")}
     for geom in chair.iter("geom"):
         if geom.get("name") in handle_names:
             geom.set("contype", "8")
-            geom.set("conaffinity", "16")
+            geom.set("conaffinity", "17")
             geom.set("friction", "2.2 0.12 0.02")
             geom.set("condim", "3")
             geom.set("solref", "0.006 1")
             geom.set("solimp", "0.98 0.99 0.001")
-        else:
-            geom.set("conaffinity", "1")
+    # Rigid body hull for walls/floor/base only (conaffinity bit 1). It stops
+    # short of the handle tips and below handle height so the arms can still
+    # pinch. Arms are bit 4, so they do not collide with this box.
+    # Covers seat, wheels and footrests. Stops short of the handle tips
+    # (x≈-0.41) and below handle height so the jaws can still pinch.
+    ET.SubElement(chair, "geom", name="wc_hull", type="box",
+                  pos="0.22 0 0.46", size="0.41 0.39 0.40",
+                  rgba="0.2 0.2 0.25 0.0", group="3", contype="8", conaffinity="1",
+                  friction="1.6 0.12 0.02", condim="3", margin="0.004",
+                  solref="0.002 1", solimp="0.95 0.99 0.001")
+    for joint in chair.iter("joint"):
+        name = joint.get("name") or ""
+        if "base_free" in name:
+            continue
+        joint.set("damping", "8")
     wb.append(chair)
 
     # Constraints / actuators / sensors from both sources.
@@ -308,6 +313,10 @@ def build(obstacle=False, config_path=None):
         ET.SubElement(equality, "connect", name=f"{side}_wheelchair_grasp",
                       site1=f"{side}_grasp", site2=f"wc_{side}_handle_grasp",
                       active="false")
+    ET.SubElement(equality, "weld", name="chair_hitch",
+                  body1="mobile_base", body2="wc_wheelchair",
+                  active="false", relpose="0 0 0 1 0 0 0",
+                  solref="0.004 1", solimp="0.9 0.95 0.001")
 
     actuator = ET.SubElement(root, "actuator")
     for act in robot.find("actuator"):

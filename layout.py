@@ -40,11 +40,6 @@ SPAWN = {
 # hallway leaving a 0.8 m gap on its south side.
 OBSTACLE = dict(pos=(0.0, 0.3, 0.3), size=(0.25, 0.25, 0.3))
 
-# Simulated lidar calibration: angles are degrees relative to the robot's forward axis.
-RF_ANGLES_DEG = list(range(-60, 61, 15))
-RF_HEIGHT = 0.30
-RF_CUTOFF = 4.0
-
 # Collision bitmasks. World geoms (walls, floor, wheelchair, obstacle) accept
 # both the base (bit 1) and the arms (bit 4); the arms only collide with world
 # geoms, never with the robot itself.
