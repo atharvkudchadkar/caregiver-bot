@@ -98,6 +98,7 @@ class ObservedMap:
         self._previous_position = None
         self.targets = {}
         self._traversable = None
+        self._confirmed_clear = None
         # Known occupied footprint at startup; no assumed room, corridor, or route.
         yy, xx = np.mgrid[:self.size, :self.size]
         footprint = np.hypot(xx-self.offset, yy-self.offset) * self.resolution <= self.radius + 0.1
@@ -115,6 +116,7 @@ class ObservedMap:
 
     def integrate(self, free, blocked, labels, pose):
         self._traversable = None
+        self._confirmed_clear = None
         # Count a cell once per observation, not once per pixel. Obstacles win
         # conflicting observations; later unobstructed observations can clear them.
         for points, value in ((free, -1.0), (blocked, 2.5)):
@@ -139,6 +141,42 @@ class ObservedMap:
                     if self.inside(cell):
                         self.traveled[cell[1], cell[0]] = True
             self._previous_position = pose[:2].copy()
+
+    def clear_footprint(self, pose, footprint):
+        """Force evidence inside a robot-local (rear, front, side) box to
+        confirmed-clear (seen=True, evidence at the free floor), the same
+        convention __init__ uses for the robot's own footprint disk at
+        startup. Used when a region becomes newly excluded from observation
+        (the wheelchair rigidly linking on and becoming part of the robot's
+        own body) - evidence recorded there *before* exclusion kicked in
+        (e.g. the real, stationary chair seen from a distance while still
+        being approached) would otherwise keep reading as a confirmed
+        obstacle forever, since the exclusion only prevents *future* votes.
+
+        Marking it merely *unseen* instead of confirmed-clear was tried first
+        and was wrong: traversable() (route()'s strict planner) treats unseen
+        space as unsafe, and this box sits immediately in front of the robot,
+        so every route needed its very first step to cross it - the robot
+        could rotate to scan but could never plan a single step forward while
+        towing, endlessly rescanning without ever finding a path."""
+        rear, front, side = footprint
+        corners_local = np.array([[rear, side], [front, side], [front, -side], [rear, -side]])
+        corners_map = local_to_map(corners_local, pose)
+        cells = self.cells(corners_map)
+        x0, y0 = np.maximum(cells.min(axis=0), 0)
+        x1, y1 = np.minimum(cells.max(axis=0), self.size - 1)
+        if x0 > x1 or y0 > y1:
+            return
+        yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+        points_map = self.xy(np.column_stack((xx.ravel(), yy.ravel())))
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        rel = (points_map - pose[:2]) @ np.array([[c, -s], [s, c]])
+        inside = (rel[:, 0] >= rear) & (rel[:, 0] <= front) & (np.abs(rel[:, 1]) <= side)
+        xs, ys = xx.ravel()[inside], yy.ravel()[inside]
+        self.evidence[ys, xs] = -3   # matches __init__'s own startup footprint disk
+        self.seen[ys, xs] = True
+        self._traversable = None
+        self._confirmed_clear = None
 
     def traveled_route(self, start_xy, goal_xy):
         """Topology learned from motion, used only as a guide for live local planning."""
@@ -172,6 +210,16 @@ class ObservedMap:
                     heapq.heappush(queue, (candidate, v))
         return []
 
+    def set_radius(self, radius):
+        """Change the clearance radius used by traversable()/route() (e.g. a
+        wider effective footprint while towing the wheelchair). Cheap no-op
+        if unchanged; otherwise invalidates the cached inflation so the next
+        traversable() call recomputes it at the new radius."""
+        if radius != self.radius:
+            self.radius = radius
+            self._traversable = None
+            self._confirmed_clear = None
+
     def traversable(self, now=None):
         if self._traversable is None:
             occupied = ((self.evidence >= 0) | ~self.seen).astype(np.uint8)
@@ -182,6 +230,28 @@ class ObservedMap:
         if now is None:
             return self._traversable
         return self._traversable & ~(self.blocked_until > now)
+
+    def confirmed_clear(self, now=None):
+        """Like traversable(), but unseen space counts as passable - only an
+        actually-observed obstacle (seen and evidence >= 0) gets avoided.
+
+        traversable()'s "unknown is never safe" rule is right for autonomous
+        planning, which must never assume unmapped space is clear. It's wrong
+        for guard()'s manual-drive safety net: a human actively watching the
+        camera feed judges unseen space themselves, and vetoing every manual
+        command that reaches past the already-explored bubble (which, on a
+        freshly started or just-switched-to memory, is nearly everywhere)
+        makes manual driving - including the manual exploration used to seed
+        that very memory - feel like the controls don't work at all."""
+        if self._confirmed_clear is None:
+            occupied = (self.evidence >= 0) & self.seen
+            radius = int(math.ceil(self.radius / self.resolution))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
+            inflated = cv2.dilate(occupied.astype(np.uint8), kernel).astype(bool)
+            self._confirmed_clear = ~inflated
+        if now is None:
+            return self._confirmed_clear
+        return self._confirmed_clear & ~(self.blocked_until > now)
 
     def block_temporarily(self, xy, now, radius=1.5, duration=45.0):
         """Treat a neighborhood as impassable until `now + duration`.
@@ -300,8 +370,8 @@ class ObservedMap:
             path.append(previous[path[-1]])
         return [self.xy(cell) for cell in reversed(path)]
 
-    def safe_segment(self, start, end, now=None):
-        free = self.traversable(now)
+    def safe_segment(self, start, end, now=None, strict=True):
+        free = self.traversable(now) if strict else self.confirmed_clear(now)
         n = max(2, int(np.linalg.norm(np.asarray(end)-start) / self.resolution * 2) + 1)
         cells = self.cells(np.linspace(start, end, n))
         if not ((cells >= 0) & (cells < self.size)).all():
@@ -328,6 +398,8 @@ class VisionNavigator:
         self.config = config
         self.room, self.goal = room, None if goal is None else np.asarray(goal, float)
         self.vision = FloorVision(config)
+        self._base_camera_names = {c["name"] for c in config["cameras"] if c.get("body") == "mobile_base"}
+        self.tow_footprint = None
         if memory is not None:
             self.map = memory.grid
             self.memory = memory
@@ -353,7 +425,110 @@ class VisionNavigator:
         self.arrival_yaw = None
         self.memory_hint = None
         self.backup_attempts = 0
+        self.backup_until = None
+        self.unstick_attempts = 0
         self.stall_since = None
+        self.towing = False
+        self.scan_direction = 1.0
+        self.last_collision = -math.inf
+
+    def notify_collision(self, now):
+        """Called (see run_world.py) the instant push_wheelchair.py's
+        block_wall_clip() detects the towed chair actually hit something.
+        Without this, SCANNING/BACKING_UP keep commanding the same turn
+        direction every tick regardless - the wall-clip rollback undoes the
+        motion, so it just grinds against the same spot instead of trying
+        anything different (confirmed: the chair's own hull scraping a wall
+        while backing up and turning one fixed way, frozen in place for the
+        rest of that attempt). Flip which way it turns next; a fresh
+        scan/backup attempt in the other direction may find clearance the
+        first one couldn't, and if that also fails it'll flip again, falling
+        through to the backup/unstick escalation below.
+
+        Also timestamps the collision (see command()'s CAMERA_LOST branch):
+        wedging the chair's hull tight against a wall can leave the head
+        camera facing nothing but that wall at point-blank range, with no
+        floor pixels to plan against - CAMERA_LOST then just sits frozen
+        forever with no vision-based way out."""
+        self.last_collision = now
+        if self.state in ("SCANNING", "BACKING_UP"):
+            self.scan_direction *= -1.0
+            self.scan_angle = 0.0
+
+    def set_towing(self, towing):
+        """Widen (or restore) the effective clearance radius route()/
+        safe_segment() plan against - call each tick with whether the
+        wheelchair is currently linked. The robot alone is the only thing
+        actually driving, but a rigid trailing load needs more real-world
+        margin than the bare chassis: routes hug walls/corners less tightly,
+        and the in-place rotation scan (see command()) checks the same wider
+        radius before spinning, since that's what wedged it into a wall
+        during early towing testing - a full blind rotation sweeps the
+        trailing chair through a wide arc around the pivot."""
+        towing = bool(towing)
+        if towing != self.towing:
+            self.towing = towing
+            self.map.set_radius(self.config["tow_robot_radius"] if towing else self.config["robot_radius"])
+
+    def set_tow_footprint(self, footprint):
+        """`footprint`, while linked, is (rear, front, side): a box in the
+        ROBOT's own local frame (x forward, y left) to exclude from floor/
+        obstacle classification. None when not linked.
+
+        Pushing the chair ahead of the robot puts it squarely in the
+        forward-facing camera's view - and so are the robot's own arms,
+        permanently extended forward gripping the handles for as long as
+        it's linked (confirmed: a "confirmed obstacle" was showing up well
+        inside where the chair's own hull starts, i.e. it was arms, not
+        chair). The floor classifier has no notion of "that's my own body/
+        towed chair, not a real wall"; without this it keeps reporting a
+        false obstacle a few tens of cm ahead for as long as it tows, which
+        is exactly what a human driving manually (or route()) then gets
+        blocked by. `rear` starts just past the robot's own leading edge
+        (not 0 - the robot's own nose is real and should still be avoided
+        if actually about to hit something), `front` reaches to the chair's
+        actual hull front edge, `side` generously covers the wider of the
+        chair or the outstretched arms - approximate on purpose: robust
+        coverage of "definitely my own stuff" matters more than a tight fit
+        here, since anything in between is never a real navigation hazard
+        while linked anyway (it's fixed relative to the robot)."""
+        self.tow_footprint = footprint
+
+    def _exclude_tow_footprint(self, points):
+        if self.tow_footprint is None or len(points) == 0:
+            return points
+        rear, front, side = self.tow_footprint
+        inside = (points[:, 0] >= rear) & (points[:, 0] <= front) & (np.abs(points[:, 1]) <= side)
+        return points[~inside]
+
+    def _tow_scan_blocked(self, pose):
+        """While towing, refuse to blindly rotate in place if a wall is
+        already confirmed within the wider tow-envelope (set_towing's
+        inflated radius) around the current spot. A full in-place rotation
+        sweeps the trailing chair through a wide arc around the pivot -
+        exactly what wedged it into a wall during early towing testing - so
+        prefer backing straight up instead (see the two SCANNING checks in
+        command()).
+
+        Checks for a *confirmed* obstacle specifically (seen and evidence >
+        0), not `traversable()` - that treats unseen space as unsafe too,
+        which is right for route planning (never assume unseen is free) but
+        wrong here: on a freshly started or just-switched-to memory (e.g.
+        right after attaching the wheelchair) nothing nearby has been
+        observed yet, and scanning is how it gets observed in the first
+        place. Blocking on "unseen" left it refusing to ever scan at all,
+        cycling straight through backup attempts to BLOCKED in seconds."""
+        if not self.towing:
+            return False
+        cx, cy = self.map.cells(pose[:2])
+        if not (0 <= cx < self.map.size and 0 <= cy < self.map.size):
+            return False
+        r = int(math.ceil(self.map.radius / self.map.resolution))
+        y0, y1 = max(0, cy-r), min(self.map.size, cy+r+1)
+        x0, x1 = max(0, cx-r), min(self.map.size, cx+r+1)
+        seen = self.map.seen[y0:y1, x0:x1]
+        evidence = self.map.evidence[y0:y1, x0:x1]
+        return bool((seen & (evidence > 0)).any())
 
     def observe(self, frames, pose):
         # Reject missing/stale cameras rather than treating unavailable pixels as clear.
@@ -362,7 +537,21 @@ class VisionNavigator:
         if not all(f.rgb.shape == (self.config["height"], self.config["width"], 3)
                    and np.isfinite(f.rgb).all() for f in frames):
             return
-        free, blocked, labels = self.vision.observe(frames)
+        # While towing, the hand cameras are rigidly gripping the wheelchair
+        # and see nothing but its own frame/seat at close range for as long
+        # as it's linked. The floor/obstacle classifier has no notion of
+        # "that's my own attached chair, not a real wall", so left unfiltered
+        # it paints a permanent false obstacle right at the robot's own
+        # position the whole time it tows - which is why route()/scan safety
+        # checks kept finding "a wall" immediately next to it regardless of
+        # the actual room. The base-mounted camera alone still sees the
+        # floor ahead and is unaffected by what the arms are holding.
+        vision_frames = [f for f in frames if self._base_camera_names and f.name in self._base_camera_names] \
+            if self.towing else frames
+        if not vision_frames:
+            vision_frames = frames
+        free, blocked, labels = self.vision.observe(vision_frames)
+        free, blocked = self._exclude_tow_footprint(free), self._exclude_tow_footprint(blocked)
         if len(free) < 50:
             self.last_frame = -math.inf
             return
@@ -372,6 +561,18 @@ class VisionNavigator:
             return
         self.current_pose = map_pose
         self.map.integrate(free, blocked, {}, map_pose)
+        if self.tow_footprint is not None:
+            # Self-healing: excluding future points isn't enough on its own -
+            # anything already recorded there (the chair legitimately seen
+            # from a distance before it was linked, stale evidence loaded
+            # from a previous towing session's saved map, a false reading
+            # from an off-axis moment mid-turn) would otherwise keep vetoing
+            # movement forever. Keep re-clearing it every tick so the zone
+            # the chair/arms actually occupy always reads as confirmed-clear
+            # instead (not merely unseen - route() treats unseen as unsafe,
+            # and this box sits right in front of the robot, so "unseen"
+            # would block every route from ever taking a first step).
+            self.map.clear_footprint(map_pose, self.tow_footprint)
         self.memory.learn_entry_targets()
         if self.room in self.map.targets:
             self.goal = self.map.targets[self.room]
@@ -383,6 +584,17 @@ class VisionNavigator:
             return 0.0, 0.0
         if now - self.last_frame > 0.5 or now < self.last_frame:
             self.state = "CAMERA_LOST"
+            if now - self.last_collision < 5.0:
+                # Wedged tight enough against something that the head camera
+                # sees no floor at all - normally CAMERA_LOST just waits, but
+                # there's nothing to wait FOR here since no frame will ever
+                # satisfy len(free)>=50 from this exact spot. block_wall_clip
+                # already refuses any move that would clip through a wall, so
+                # blindly backing away is safe even without vision to confirm
+                # it - it can only get rolled back again, never make things
+                # worse, and moving away is exactly what restores a clear
+                # view. Mirrors BACKING_UP's own recovery command.
+                return -0.12, 0.3 * self.scan_direction
             return 0.0, 0.0
         if not self.memory.localized:
             if self.localization_yaw is not None:
@@ -416,7 +628,7 @@ class VisionNavigator:
             # point before the 45s mark gives up for good; a few seconds of
             # different geometry in view is often enough to unstick it.
             self.state = "BACKING_UP"
-            return -0.12, 0.3
+            return -0.12, 0.3 * self.scan_direction
         tolerance = self.config["room_stop_distance"] if self.room else 0.3
         if self.goal is not None and np.linalg.norm(self.goal - pose[:2]) < tolerance:
             if self.room in self.memory.rooms:
@@ -433,9 +645,9 @@ class VisionNavigator:
             self.scan_angle += abs((pose[2]-self.last_yaw + math.pi) % (2*math.pi) - math.pi)
         self.last_yaw = pose[2]
         if self.initial_scan:
-            if self.goal is None and self.scan_angle < 2*math.pi:
+            if self.goal is None and self.scan_angle < 2*math.pi and not self._tow_scan_blocked(pose):
                 self.state = "SCANNING"
-                return 0.0, 0.4
+                return 0.0, 0.4 * self.scan_direction
             self.initial_scan = False
             self.scan_angle = 0.0
         if now - self.last_plan >= 0.5:
@@ -473,22 +685,60 @@ class VisionNavigator:
             # and rescanning - a different vantage point a bit further back
             # can reveal a frontier that was occluded or too close to a wall
             # to register from here - before finally giving up.
-            if self.scan_angle < 2*math.pi:
+            if self.scan_angle < 2*math.pi and not self._tow_scan_blocked(pose):
+                self.backup_until = None
                 self.state = "SCANNING"
-                return 0.0, 0.4
-            if self.backup_attempts < 3:
+                return 0.0, 0.4 * self.scan_direction
+            # Each backup "attempt" gets a real couple of seconds of actually
+            # backing up, not one instantaneous nudge - command() runs every
+            # camera frame (~8/s), so without a real timer this whole 3-try
+            # escalation collapsed into under a second regardless of whether
+            # backing up was actually helping, giving it no real chance to
+            # gain clearance before giving up.
+            if self.backup_until is None or now >= self.backup_until:
+                # A fresh attempt also tries the other turn direction - if
+                # the chair's wide swing just clipped a wall on one side (see
+                # notify_collision, which also flips this reactively the
+                # instant an actual hit is detected), backing up while
+                # continuing to turn the SAME way can just grind against it
+                # again for the full 2s before ever reconsidering.
                 self.backup_attempts += 1
+                self.backup_until = now + 2.0
+                self.scan_angle = 0.0
+                self.scan_direction *= -1.0
+            if self.backup_attempts <= 3:
+                self.state = "BACKING_UP"
+                return -0.12, 0.3 * self.scan_direction
+            self.backup_until = None
+            if self.unstick_attempts < 3:
+                # Scanning and backing up found nothing reachable either - the
+                # locally "known free" evidence right here may simply be too
+                # narrow or off-centre for the current clearance radius (e.g.
+                # towing: a route recorded earlier by the smaller,
+                # unencumbered robot doesn't leave room for the wider one).
+                # Block the immediate area for a while so replanning is
+                # forced to look further afield - toward a frontier it
+                # hasn't tried yet - instead of concluding there's no way
+                # through at all.
+                self.unstick_attempts += 1
+                self.map.block_temporarily(pose[:2], now)
+                self.backup_attempts = 0
                 self.scan_angle = 0.0
                 self.state = "BACKING_UP"
-                return -0.12, 0.3
+                return -0.12, 0.3 * self.scan_direction
             self.state = "BLOCKED"
             return 0.0, 0.0
-        self.scan_angle = 0.0
-        self.backup_attempts = 0
-        # Use a short checked lookahead; never cut corners through inflated obstacles.
+        # Use a short checked lookahead; never cut corners through inflated
+        # obstacles. Shorter while towing: safe_segment only checks straight-
+        # line clearance to the target point, not the swept area of the turn
+        # needed to face it, and a rigid trailing load can clip a doorway
+        # edge mid-turn even when both endpoints check clear. A shorter
+        # leash forces smaller, more frequent heading corrections instead of
+        # one sharp pivot committed to a distant waypoint near a doorway.
+        lookahead = 0.28 if self.towing else 0.45
         target = None
         for point in self.path[1:]:
-            if np.linalg.norm(point-pose[:2]) > 0.45:
+            if np.linalg.norm(point-pose[:2]) > lookahead:
                 break
             if self.map.safe_segment(pose[:2], point, now):
                 target = point
@@ -511,7 +761,21 @@ class VisionNavigator:
                 self.stall_since = None
             self.state = "REPLANNING"
             return 0.0, 0.0
+        # Only reset the escalation counters on a genuine successful step -
+        # not merely because route() found *some* path this cycle. A path
+        # that gets found and then immediately rejected by the lookahead
+        # above (target stays None) used to reset backup_attempts/
+        # unstick_attempts to 0 right before this point regardless, so a
+        # route that flickers between "found" and "rejected" could nudge the
+        # base backward via BACKING_UP indefinitely (moving it somewhere
+        # worse, e.g. into a wall) without ever accumulating the 3 failures
+        # needed to trigger block_temporarily and actually try elsewhere.
         self.stall_since = None
+        self.scan_angle = 0.0
+        self.backup_attempts = 0
+        self.backup_until = None
+        self.unstick_attempts = 0
+        self.scan_direction = 1.0
         delta = target - pose[:2]
         err = (math.atan2(delta[1], delta[0]) - pose[2] + math.pi) % (2*math.pi) - math.pi
         if self.goal is None:
@@ -524,7 +788,16 @@ class VisionNavigator:
         return v, float(np.clip(1.5 * err, -0.5, 0.5))
 
     def guard(self, pose, now, v, w):
-        """Teleop also requires fresh observed clearance in the direction of travel."""
+        """Teleop also requires clearance in the direction of travel - but
+        only vetoes a *confirmed* obstacle (strict=False), not merely unseen
+        space. A human driving manually is watching the camera feed and
+        judging unseen space themselves; that's the point of overriding
+        autonomy. Using the strict (autonomous) traversable() check here
+        instead would reject any command that reaches past the
+        already-explored bubble - nearly every direction on a freshly
+        started or just-switched-to memory - making manual driving feel
+        broken exactly when it's most needed (e.g. manually seeding a new
+        towing memory that has nothing explored yet)."""
         if now-self.last_frame > 0.5:
             return 0.0, 0.0
         if not self.memory.localized:
@@ -532,7 +805,7 @@ class VisionNavigator:
         pose = self.memory.pose(pose)
         distance = math.copysign(0.35 + abs(v)*0.5, v)
         end = pose[:2] + distance * np.array([math.cos(pose[2]), math.sin(pose[2])])
-        return (v if v == 0 or self.map.safe_segment(pose[:2], end, now) else 0.0), w
+        return (v if v == 0 or self.map.safe_segment(pose[:2], end, now, strict=False) else 0.0), w
 
     def explain(self, v=0.0, w=0.0):
         """Concise observable intent for terminal narration, including wait reasons."""

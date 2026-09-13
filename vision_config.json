@@ -3,12 +3,13 @@
   "height": 360,
   "fps": 8,
   "fovy": 80,
-  "wheel_radius": 0.0846,
-  "wheel_track": 0.32216,
-  "base_height": 0.005,
+  "wheel_radius": 0.059219999999999995,
+  "wheel_track": 0.225512,
+  "base_height": 0.0034999999999999996,
   "map_size": 30.0,
   "resolution": 0.1,
-  "robot_radius": 0.28,
+  "robot_radius": 0.2,
+  "tow_robot_radius": 0.24,
   "room_stop_distance": 0.3,
   "max_range": 3.5,
   "floor_max_chroma": 0.035,
@@ -18,9 +19,9 @@
       "name": "head_cam",
       "body": "mobile_base",
       "offset": [
-        0.16,
-        0,
-        1.5
+        0.112,
+        0.0,
+        1.05
       ],
       "yaw_deg": 0,
       "pitch_deg": 20
@@ -29,9 +30,9 @@
       "name": "left_hand_cam",
       "body": "l_hand__hand",
       "offset": [
-        0.12,
-        0.08,
-        0
+        0.084,
+        0.056,
+        0.0
       ],
       "yaw_deg": 25,
       "pitch_deg": 45
@@ -40,9 +41,9 @@
       "name": "right_hand_cam",
       "body": "hand__hand",
       "offset": [
-        0.12,
-        -0.08,
-        0
+        0.084,
+        -0.056,
+        0.0
       ],
       "yaw_deg": -25,
       "pitch_deg": 45

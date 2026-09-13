@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(timeout 220 python run_world.py --goto kitchen --headless --seconds 180 --no-memory)",
+      "Bash(nohup python run_world.py --goto kitchen --headless --seconds 300 --no-memory)",
+      "Bash(echo \"started pid $!\")",
+      "Bash(taskkill //F //PID 21236)",
+      "Bash(python run_world.py --camera-preview --voice --voice-device 1 --speed-slider)",
+      "Bash(timeout 40 python run_world.py --explore --headless --seconds 30 --no-memory)",
+      "Bash(nohup python run_world.py --explore --headless --seconds 900)",
+      "Bash(tasklist)",
+      "Bash(rm -f overview.png topdown*.png hallway_zoom*.png)",
+      "Bash(nohup python run_world.py --goto bathroom --headless --seconds 300)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\akash\\OneDrive\\Desktop\\utwat"
+    ]
+  }
+}

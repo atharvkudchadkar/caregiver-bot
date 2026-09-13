@@ -1,0 +1,40 @@
+lining up on the wheelchair; arrows nudge, Space resumes auto alignment
+0.0s: approach
+[0.0s] attaching the wheelchair before training starts
+  lineup yaw=-50.1 deg  goal=1.09 m  offset=-0.10 m  side=-1.08 m  - Space resumes auto alignment
+  lineup yaw=-0.8 deg  goal=0.98 m  offset=-0.11 m  side=-0.98 m  - Space resumes auto alignment
+  lineup yaw=-0.0 deg  goal=0.58 m  offset=-0.07 m  side=-0.57 m  - Space resumes auto alignment
+  lineup yaw=-0.0 deg  goal=0.27 m  offset=-0.03 m  side=-0.27 m  - Space resumes auto alignment
+  lineup yaw=+1.5 deg  goal=0.08 m  offset=-0.01 m  side=-0.08 m  - Space resumes auto alignment
+  lineup yaw=+0.8 deg  goal=0.10 m  offset=-0.01 m  side=-0.10 m  - Space resumes auto alignment
+  lineup yaw=+29.6 deg  goal=0.05 m  offset=+0.00 m  side=-0.05 m  - Space resumes auto alignment
+14.6s: align
+planning the pinch from the wheelchair pose
+15.1s: arm_pregrasp
+19.0s: move_in
+20.3s: close
+  right hand has opposing pad contacts at gripper 0.05
+  left hand has opposing pad contacts at gripper 0.05
+21.9s: verify
+both handles clamped: {('right', 'lower'): 3, ('right', 'upper'): 3, ('left', 'lower'): 1, ('left', 'upper'): 1}
+  grippers locked at verified handle contacts; X releases them
+  one body at (+0.42, -0.05) m, +0.9 deg in the robot frame
+22.6s: drive
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+[kitchen] TIMEOUT after 270.0s (state=EXPLORING, linked=True, push.state=drive)
+[bathroom] ARRIVED after 33.5s (state=ARRIVED, linked=True, push.state=drive)
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+  wheelchair clearance reached a barrier; steer away with arrows
+  STUCK_LOOP pose=[ 6.43502419 -1.8143338   1.62856434] goal=None state=SCANNING path_len=0 linked=True push.state=drive
+[living_room] STUCK_LOOP after 90.0s (state=SCANNING, linked=True, push.state=drive)
+
+=== TOWING TRAINING SUMMARY ===
+kitchen      TIMEOUT     270.0s
+bathroom     ARRIVED      33.5s
+living_room  STUCK_LOOP   90.0s
+PAUSED_FOR_STUCK_LOOP

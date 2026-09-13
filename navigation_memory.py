@@ -44,6 +44,17 @@ class NavigationMemory:
     def pose(self, odometry):
         return compose(self.transform, odometry)
 
+    def seed_pose(self, known_pose, odometry):
+        """Align this memory's transform so pose(odometry) reproduces
+        known_pose right now, and mark it localized - for switching to a
+        different persisted memory (e.g. towing vs plain) without a physical
+        move. The robot hasn't gone anywhere, only which map/landmark
+        database it's consulting changed, so it shouldn't have to blindly
+        re-localize (turn in place hunting for a sign) just to reuse a pose
+        it already knows - especially risky while towing near a wall."""
+        self.transform = compose(known_pose, inverse(odometry))
+        self.localized = True
+
     def load(self):
         # No pickled Python objects. Validate before replacing any live map data.
         try:

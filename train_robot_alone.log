@@ -1,0 +1,14 @@
+[bedroom -> kitchen] ARRIVED after 220.8s (state=ARRIVED)
+[kitchen -> bathroom] ARRIVED after 141.8s (state=ARRIVED)
+[bathroom -> living_room] ARRIVED after 39.8s (state=ARRIVED)
+[living_room -> bedroom] ARRIVED after 113.3s (state=ARRIVED)
+[bedroom -> bathroom] ARRIVED after 38.9s (state=ARRIVED)
+[kitchen -> living_room] ARRIVED after 35.2s (state=ARRIVED)
+
+=== ROBOT-ALONE TRAINING SUMMARY ===
+bedroom      -> kitchen      ARRIVED     220.8s
+kitchen      -> bathroom     ARRIVED     141.8s
+bathroom     -> living_room  ARRIVED      39.8s
+living_room  -> bedroom      ARRIVED     113.3s
+bedroom      -> bathroom     ARRIVED      38.9s
+kitchen      -> living_room  ARRIVED      35.2s

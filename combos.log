@@ -1,0 +1,14 @@
+[bedroom -> kitchen] ARRIVED after 159.6s (state=ARRIVED)
+[kitchen -> bathroom] ARRIVED after 87.8s (state=ARRIVED)
+[bathroom -> living_room] TIMEOUT after 320.0s (state=EXPLORING)
+[living_room -> bedroom] TIMEOUT after 320.0s (state=INSPECTING_ROUTE)
+[bedroom -> bathroom] TIMEOUT after 320.0s (state=INSPECTING_ROUTE)
+[kitchen -> living_room] ARRIVED after 84.8s (state=ARRIVED)
+
+=== SUMMARY ===
+bedroom      -> kitchen      ARRIVED     159.6s
+kitchen      -> bathroom     ARRIVED      87.8s
+bathroom     -> living_room  TIMEOUT     320.0s
+living_room  -> bedroom      TIMEOUT     320.0s
+bedroom      -> bathroom     TIMEOUT     320.0s
+kitchen      -> living_room  ARRIVED      84.8s

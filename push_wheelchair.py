@@ -18,11 +18,18 @@ import mujoco.viewer
 import numpy as np
 from scipy.optimize import least_squares
 
+import layout
 from build_world import build
 from robot_base import Arms, BalanceBase, wrap
 
 
-MARKER_TO_TIP = -0.181  # handle tip is 181 mm behind the marker face
+# The wheelchair's own geometry (assets/wheelchair.xml) is scaled down by
+# layout.CHAIR_SCALE at build time (see build_world.py's scale_tree) for more
+# maneuvering clearance without moving any wall/doorway - every distance
+# below that's measured against the chair (not the robot's own gripper
+# mechanics) scales the same way so the grasp geometry stays consistent.
+CHAIR_SCALE = layout.CHAIR_SCALE
+MARKER_TO_TIP = -0.181 * CHAIR_SCALE  # handle tip is 181 mm behind the marker face, at full scale
 DRIVE_SPEED = 0.08
 TURN_SPEED = 0.35
 # Forward, left arc, forward again — shows the linked pair translating and turning.
@@ -35,19 +42,31 @@ GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32,
              "g": 71, "x": 88}
 PARK_ARM = {f"{p}{i}": 0.0 for p in ("rj", "lj") for i in range(7)}
 ATTACH_STATES = ("find", "approach", "align", "arm_pregrasp", "move_in", "close", "verify")
-ARM_SETUP_BACKOFF = 0.07   # open jaws hover this far behind the tip
+ARM_SETUP_BACKOFF = 0.07   # open jaws hover this far behind the tip (robot gripper, not chair scale)
 BASE_SLIDE_DISTANCE = 0.07  # must match backoff so the tip actually enters the jaws
-APPROACH_STANDOFF = 0.55    # park this far behind the rear marker before pinching
+APPROACH_STANDOFF = 0.55 * CHAIR_SCALE   # park this far behind the rear marker before pinching
 # Inflated chair footprint in its own frame: wheels/frame plus robot clearance.
-CHAIR_REAR_X, CHAIR_FRONT_X, CHAIR_SIDE_Y = -0.70, 0.85, 0.64
-DETOUR_REAR_X, DETOUR_FRONT_X, DETOUR_SIDE_Y = -0.94, 1.02, 0.84
+# Deliberately oversized for path-planning detours (chair_avoidance_waypoints)
+# - NOT the chair's real silhouette, so don't reuse these for vision exclusion
+# (see HULL_* below): they'd blank out most of the floor directly ahead, not
+# just the chair, and the robot would see nothing "free" close enough to move
+# into (confirmed: manual drive commands got silently vetoed by the resulting
+# stale-camera check, not by an actual obstacle).
+CHAIR_REAR_X, CHAIR_FRONT_X, CHAIR_SIDE_Y = (-0.70 * CHAIR_SCALE, 0.85 * CHAIR_SCALE, 0.64 * CHAIR_SCALE)
+DETOUR_REAR_X, DETOUR_FRONT_X, DETOUR_SIDE_Y = (-0.94 * CHAIR_SCALE, 1.02 * CHAIR_SCALE, 0.84 * CHAIR_SCALE)
+# The chair's actual rigid collision hull (build_world.py: pos=0.22*cs,
+# size=0.41*cs x 0.39*cs), for excluding its real silhouette from the floor/
+# obstacle classifier while towing - see VisionNavigator.set_tow_footprint.
+HULL_REAR_X, HULL_FRONT_X, HULL_SIDE_Y = ((0.22 - 0.41) * CHAIR_SCALE,
+                                          (0.22 + 0.41) * CHAIR_SCALE,
+                                          0.39 * CHAIR_SCALE)
 ARM_SETTLE_S = 6.0
 LINEUP_STATES = ("find", "approach")
 CLOSE_SETTLE_S = 6.0
 VERIFY_SETTLE_S = 5.0
 OPEN_GRIP = 1.0
 CLOSED_GRIP = {"right": 0.0, "left": 0.0}
-PAD_CENTER_OFFSET = 0.021  # 13 mm tip half-thickness + 6 mm pad + 2 mm clearance
+PAD_CENTER_OFFSET = 0.021  # pre-close pad offset; closing takes up the handle clearance
 SAFE_POSE_AGE_S = 0.2  # keep rollback clear of the contact boundary
 
 
@@ -60,7 +79,7 @@ def obj_id(model, kind, name):
 
 def set_demo_pose(model, data):
     """Leave a clear, reachable rear approach in the bedroom."""
-    for joint, xyz in (("base_free", (-4.8, 2.2, 0.005)),
+    for joint, xyz in (("base_free", (-4.8, 2.2, 0.005 * layout.ROBOT_SCALE)),
                        ("wc_base_free", (-3.7, 2.2, -0.055))):
         jid = obj_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
         adr = model.jnt_qposadr[jid]
@@ -72,14 +91,14 @@ def set_demo_pose(model, data):
 def handle_targets(marker_pose):
     """World points of the two handle tips (the free ends that face the robot)."""
     center, x_axis, y_axis = marker_pose
-    common = center + MARKER_TO_TIP * x_axis + np.array([0, 0, 0.116])
-    return {"right": common - 0.18 * y_axis, "left": common + 0.18 * y_axis}
+    common = center + MARKER_TO_TIP * x_axis + np.array([0, 0, 0.116 * CHAIR_SCALE])
+    return {"right": common - 0.18 * CHAIR_SCALE * y_axis, "left": common + 0.18 * CHAIR_SCALE * y_axis}
 
 
 def chair_avoidance_waypoints(start, marker_pose):
     """Route around the inflated wheelchair footprint to its rear centerline."""
     center, x_axis, y_axis = marker_pose
-    chair_origin = center[:2] + 0.231 * x_axis[:2]
+    chair_origin = center[:2] + 0.231 * CHAIR_SCALE * x_axis[:2]
     def local(point):
         delta = np.asarray(point)[:2] - chair_origin
         return np.array([np.dot(delta, x_axis[:2]), np.dot(delta, y_axis[:2])])
@@ -226,6 +245,15 @@ class PushController:
         chair_joint = obj_id(model, mujoco.mjtObj.mjOBJ_JOINT, "wc_base_free")
         self.chair_qadr = model.jnt_qposadr[chair_joint]
         self.chair_dadr = model.jnt_dofadr[chair_joint]
+        # Drive wheels roll normally against the floor even while the trailing
+        # chair is the thing actually blocked elsewhere - block_wall_clip()
+        # rolling back only the base's own qpos, every step, for as long as a
+        # jam lasts, otherwise leaves the wheel encoders reporting real
+        # rotation for net base motion that never happened (indistinguishable
+        # from slip): confirmed as the cause of a run's odometry-based pose
+        # estimate drifting far outside the building after an extended jam.
+        self.wheel_qadr = [model.jnt_qposadr[obj_id(model, mujoco.mjtObj.mjOBJ_JOINT, n)]
+                           for n in ("left_wheel_joint", "right_wheel_joint")]
         self.linked = False
         self.grasp_locked = False
         self.manual = False
@@ -261,6 +289,7 @@ class PushController:
         self._safe_pose_time = None
         self._barrier_blocked = False
         self._barrier_origin = None
+        self.collided = False   # set each block_wall_clip() call; read by nav to react
         self._planned_arms = False
         self.lineup_manual = False
         self._approach_settle = None
@@ -303,6 +332,36 @@ class PushController:
             self.model.geom_contype[gid] = contype
             self.model.geom_conaffinity[gid] = conaffinity
 
+    def chair_local_pose(self):
+        """Chair pose in the robot's own frame right now (dx, dy, dyaw) -
+        the same transform link_chair() freezes into self.hitch, but live,
+        so it's usable before linking too (e.g. while the arms are already
+        reaching for the handles)."""
+        rx, ry, ryaw = self.base.pose()
+        cx, cy, cyaw = self.chair_pose()
+        dx, dy = cx - rx, cy - ry
+        c, s = math.cos(ryaw), math.sin(ryaw)
+        return c * dx + s * dy, -s * dx + c * dy, wrap(cyaw - ryaw)
+
+    def tow_exclusion_front_x(self):
+        """How far ahead (robot-local x) the chair's hull reaches right now,
+        for VisionNavigator.set_tow_footprint - or None if there's nothing to
+        exclude yet. Covers both the linked-and-driving case (self.hitch) and
+        the arm_pregrasp/move_in/close/verify reach, where the arms are
+        already extended toward the chair before linking completes and the
+        head camera would otherwise learn a false wall there."""
+        if self.linked and self.hitch is not None:
+            return self.hitch[0] + HULL_FRONT_X
+        if self.state in ATTACH_STATES:
+            # Covers "approach"/"align" too: once close enough to line up on
+            # the chair, it's already within camera range and gets legitimately
+            # seen as an obstacle - but after linking it rigidly follows the
+            # robot at this same relative spot, so that "obstacle" reading
+            # would otherwise poison the map at a cell the robot needs to
+            # treat as driveable (itself) for good.
+            return self.chair_local_pose()[0] + HULL_FRONT_X
+        return None
+
     def link_chair(self):
         """Lock the chair to the robot; they drive as one vehicle."""
         rx, ry, ryaw = self.base.pose()
@@ -334,6 +393,8 @@ class PushController:
         self.grasp_locked = False
         self.linked = False
         self.hitch = None
+        self._safe_pose = None
+        self._safe_pose_time = None
         self._barrier_blocked = False
         self._barrier_origin = None
         self.set_chair_mesh_collisions(True)
@@ -397,7 +458,11 @@ class PushController:
         w_body = self.data.qvel[r_dadr + 3:r_dadr + 6]
         w_world = self.data.xmat[self.base.base_id].reshape(3, 3) @ w_body
         offset = np.array([cx - rx, cy - ry, 0.0])
-        self.data.qvel[dadr:dadr + 3] = v_robot + np.cross(w_world, offset)
+        # A planar hitch follows yaw and horizontal travel, not the balancing
+        # mast's pitch/vertical velocity (the chair's wheels stay on the floor).
+        self.data.qvel[dadr:dadr + 3] = (
+            v_robot[0] - w_world[2] * offset[1],
+            v_robot[1] + w_world[2] * offset[0], 0.0)
         self.data.qvel[dadr + 3:dadr + 6] = (0.0, 0.0, w_world[2])
 
     def wall_hits(self):
@@ -417,9 +482,11 @@ class PushController:
     def block_wall_clip(self):
         """Roll the linked pair back before any chair component clips a barrier."""
         if not self.linked:
+            self.collided = False
             return
         mujoco.mj_forward(self.model, self.data)
         hits = self.wall_hits()
+        self.collided = bool(hits)
         if not hits:
             if self._safe_pose_time is None or self.data.time - self._safe_pose_time >= SAFE_POSE_AGE_S:
                 self._safe_pose = self.data.qpos.copy()
@@ -430,17 +497,48 @@ class PushController:
                 self._barrier_blocked = False
                 self._barrier_origin = None
             return
+        # Tried a direct position nudge along the contact normal here for a
+        # contact that keeps recurring (rather than the rollback below),
+        # reasoning the rollback's own commanded-motion approach genuinely
+        # couldn't separate some contacts (confirmed: the chair's hull
+        # scraping a wall, where translating along the current heading barely
+        # changes the contact regardless of turn direction). In practice the
+        # repeated teleport destabilized the physics into a permanent
+        # CAMERA_LOST (NaN/inf pixels) instead of a clean escape, which is
+        # worse than the rollback's honest BLOCKED - reverted to always
+        # rolling back; only the very first-ever contact (no safe pose yet)
+        # still uses the direct nudge below.
         if self._safe_pose is not None:
-            # Preserve pitch, wheel and arm dynamics so reverse/turn commands
-            # can escape; only roll back the pair's blocked planar travel.
+            # Preserve pitch, wheel and arm dynamics (velocities/momentum) so
+            # reverse/turn commands can escape; only roll back the pair's
+            # blocked planar travel. The wheel joints' own qpos (rotation
+            # angle) is the one exception: leaving it un-rolled-back means
+            # the drive wheels keep "reporting" rotation for net base motion
+            # that this rollback just undid, indistinguishable from slip to
+            # WheelOdometry - harmless dynamically (only the angle reading
+            # moves, not velocity/torque) but left unrolled it silently
+            # drifted a run's pose estimate outside the building after an
+            # extended jam.
             self.data.qpos[self.base.qadr:self.base.qadr + 2] = self._safe_pose[self.base.qadr:self.base.qadr + 2]
+            self.data.qpos[self.wheel_qadr] = self._safe_pose[self.wheel_qadr]
             self.data.qvel[self.base.dadr:self.base.dadr + 2] = 0
             if self.base.v_cmd > 0:
                 self.base.command(0.0, self.base.w_cmd)
             self.base.reset_targets()
             self.apply_hitch()
             mujoco.mj_forward(self.model, self.data)
-            if self.wall_hits():
+            # Also restore orientation - not just position - on the very
+            # first tick of a *new* barrier contact (not self._barrier_blocked
+            # yet), even if the xy-only fix already cleared wall_hits(): a
+            # glancing hit can nudge yaw a little as a side effect of that one
+            # colliding step, and yaw_target re-anchors to whatever heading it
+            # finds right after (reset_targets() above), silently adopting
+            # that nudge as the new "straight ahead" - confirmed as the cause
+            # of manual driving no longer centering on w=0 after a collision.
+            # Once already blocked, only escalate to a forced orientation
+            # reset if position alone still doesn't clear it - otherwise this
+            # would fight the user's own attempt to turn away and escape.
+            if self.wall_hits() or not self._barrier_blocked:
                 self.data.qpos[self.base.qadr + 3:self.base.qadr + 7] = self._safe_pose[self.base.qadr + 3:self.base.qadr + 7]
                 self.data.qvel[self.base.dadr + 3:self.base.dadr + 6] = 0
                 self.apply_hitch()
@@ -460,7 +558,16 @@ class PushController:
             push += (out / span) * (depth + 0.004)
         push = np.clip(push, -0.04, 0.04)
         self.data.qpos[self.base.qadr:self.base.qadr + 2] += push
+        # Zero all base velocity (not just planar), and re-anchor the balance
+        # controller's own progress/yaw targets to the shifted pose - a
+        # position teleport without this leaves qvel/targets describing the
+        # pre-push state, which the solver reconciles next step as a huge
+        # implied velocity and previously blew up into CAMERA_LOST (NaN/inf
+        # pixels from an unstable physics state) instead of a clean escape.
+        self.data.qvel[self.base.dadr:self.base.dadr + 6] = 0
+        self.base.reset_targets()
         self.apply_hitch()
+        mujoco.mj_forward(self.model, self.data)
         self.base.fallen = False
 
     def hold_grippers_on_contact(self):
@@ -743,9 +850,9 @@ class PushController:
         self.base.step()
         self.apply_hitch()
         self.block_wall_clip()
-        if self.base.fallen:
-            self.base.fallen = False
-            self.base.reset_targets()
+        # Refresh transforms after projecting the chair freejoint so cameras,
+        # contacts and the viewer all see the attached pose on this same tick.
+        mujoco.mj_forward(self.model, self.data)
 
     def tick(self):
         self.decide()
@@ -833,7 +940,7 @@ def main():
         if args.headless:
             for _ in range(int(args.seconds / model.opt.timestep)):
                 controller.tick()
-                if controller.state in ("failed", "fallen", "lost marker"):
+                if controller.base.fallen or controller.state in ("failed", "fallen", "lost marker"):
                     break
                 if controller.linked and controller.manual and controller.drive_phase >= 0:
                     break
@@ -857,7 +964,8 @@ def main():
         print(f"final: {controller.state}, t={data.time:.1f}s, "
               f"robot={controller.base.pose()[:2]}, "
               f"chair moved {chair_x + 3.7:.3f} m, yaw {math.degrees(chair_yaw):.0f} deg")
-        if args.headless and controller.state in ("failed", "fallen", "lost marker"):
+        if args.headless and (controller.base.fallen or not controller.linked
+                              or controller.state in ("failed", "fallen", "lost marker")):
             raise SystemExit(1)
     finally:
         controller.close()

@@ -52,6 +52,21 @@ def eulers_to_radians(elem):
     return elem
 
 
+def scale_tree(elem, factor):
+    """Uniformly scale every length in a body subtree: body/geom/site `pos`,
+    `size` (box half-extents, capsule/cylinder/sphere radius/half-length -
+    every component is a length for the geom types used here), and capsule
+    `fromto` endpoints. A pure similarity transform: orientation (euler/quat/
+    axis) and non-geometric attributes (mass, friction, density, damping...)
+    are left alone, so it can be applied to a whole body - wheels, frame,
+    handles, marker, everything - as one consistent shrink."""
+    for el in elem.iter():
+        for attr in ("pos", "size", "fromto"):
+            if attr in el.attrib:
+                el.set(attr, fmt(*(float(v) * factor for v in el.attrib[attr].split())))
+    return elem
+
+
 def make_robot_solid(base):
     """Give the robot collision geometry.
 
@@ -70,6 +85,7 @@ def make_robot_solid(base):
         for g in body.findall("geom"):
             g.attrib.update(layout.COL_ARM)
     common = dict(group="3", density="0", rgba="1 0.3 0.3 0.25", **layout.COL_BASE)
+    # Authored dimensions; the complete robot is scaled together below.
     ET.SubElement(base, "geom", name="col_base", type="box",
                   size="0.13 0.2 0.08", pos="0.01 0 0.17", **common)
     ET.SubElement(base, "geom", name="col_mast", type="capsule",
@@ -144,15 +160,6 @@ def add_corridor_labels(asset, wb, config):
                           material=name, contype="0", conaffinity="0")
 
 
-def add_furniture(wb):
-    """Static props: boxes/cylinders only, collidable like walls."""
-    for room, items in layout.furniture().items():
-        for item in items:
-            ET.SubElement(wb, "geom", name=f"{room}_{item['name']}", type=item["type"],
-                          pos=fmt(*item["pos"]), size=fmt(*item["size"]),
-                          rgba=fmt(*item["rgba"]), **layout.COL_WORLD)
-
-
 def build(obstacle=False, config_path=None):
     config = load_config(config_path)
     robot = ET.parse(ROBOT_XML).getroot()
@@ -184,7 +191,11 @@ def build(obstacle=False, config_path=None):
     # Assets: robot meshes + a checker floor.
     asset = ET.SubElement(root, "asset")
     for mesh in robot.find("asset"):
-        asset.append(copy.deepcopy(mesh))
+        scaled = copy.deepcopy(mesh)
+        if scaled.tag == "mesh":
+            scaled.set("scale", fmt(*(float(v) * layout.ROBOT_SCALE
+                                     for v in scaled.get("scale", "1 1 1").split())))
+        asset.append(scaled)
     from assets.make_aruco_marker import generate as generate_wheelchair_marker
     generate_wheelchair_marker()
     ET.SubElement(asset, "texture", name="wc_aruco_texture", type="2d",
@@ -218,14 +229,10 @@ def build(obstacle=False, config_path=None):
 
     add_room_labels(asset, wb, config)
     add_corridor_labels(asset, wb, config)
-    add_furniture(wb)
 
     # Robot: the whole mobile_base subtree, plus a forward-looking head camera.
     base = copy.deepcopy(robot.find("worldbody/body[@name='mobile_base']"))
     sp = layout.SPAWN["robot"]
-    base.set("pos", fmt(*sp["pos"]))
-    base.set("quat", yaw_quat(sp["yaw_deg"]))
-    add_cameras(base, config)
     make_robot_solid(base)
     for hand_name, side, grasp_pos in (
         ("hand__hand", "right", "0.021785 -0.094351 -0.020721"),
@@ -257,12 +264,35 @@ def build(obstacle=False, config_path=None):
                       xyaxes=xyaxes, **pad_contact)
         ET.SubElement(finger, "site", name=f"{side}_{jaw}_pad_site", pos=pos,
                       xyaxes=xyaxes, size="0.003", rgba="1 0.6 0 1")
+    scale_tree(base, layout.ROBOT_SCALE)
+    # Keep explicit link masses, with inertia adjusted for shorter lever arms.
+    # Mesh-derived masses continue to follow their authored material density.
+    for inertial in base.iter("inertial"):
+        for attr in ("diaginertia", "fullinertia"):
+            if attr in inertial.attrib:
+                inertial.set(attr, fmt(*(float(v) * layout.ROBOT_SCALE**2
+                                        for v in inertial.get(attr).split())))
+    for joint in base.iter("joint"):
+        if joint.get("type") == "slide":
+            for attr in ("range", "ref", "springref"):
+                if attr in joint.attrib:
+                    joint.set(attr, fmt(*(float(v) * layout.ROBOT_SCALE
+                                         for v in joint.get(attr).split())))
+    base.set("pos", fmt(*sp["pos"][:2], sp["pos"][2] * layout.ROBOT_SCALE))
+    base.set("quat", yaw_quat(sp["yaw_deg"]))
+    # Configuration contains the actual scaled camera mount dimensions.
+    add_cameras(base, config)
     sensor = ET.Element("sensor")          # appended to root below
     ET.SubElement(sensor, "framequat", name="base_orientation", objtype="body", objname="mobile_base")
     wb.append(base)
 
     # Wheelchair: prefixed so its joint names don't collide with the robot's wheels.
+    # Scaled down (see layout.CHAIR_SCALE) while its own top-level pos is still
+    # the source file's identity "0 0 0", so the spawn position set below -
+    # a world-frame placement, not part of the chair's own proportions - is
+    # never itself scaled.
     chair = copy.deepcopy(wc.find("worldbody/body[@name='wheelchair']"))
+    scale_tree(chair, layout.CHAIR_SCALE)
     prefix_names(eulers_to_radians(chair), WC_PREFIX)
     sp = layout.SPAWN["wheelchair"]
     chair.set("pos", fmt(*sp["pos"]))
@@ -283,17 +313,21 @@ def build(obstacle=False, config_path=None):
             geom.set("solimp", "0.98 0.99 0.001")
     # Rigid body hull for walls/floor/base only (conaffinity bit 1). Covers
     # seat, wheels and footrests. Stops short of the handle tips (x=-0.41)
-    # and below handle height so the arms can still pinch.
+    # and below handle height so the arms can still pinch. Added after the
+    # chair's own geometry is already scaled, so these (at full-scale
+    # proportions here) are scaled by hand rather than by a second pass.
+    cs = layout.CHAIR_SCALE
     ET.SubElement(chair, "geom", name="wc_hull", type="box",
-                  pos="0.22 0 0.46", size="0.41 0.39 0.40",
+                  pos=fmt(0.22 * cs, 0, 0.46 * cs), size=fmt(0.41 * cs, 0.39 * cs, 0.40 * cs),
                   rgba="0.2 0.2 0.25 0.0", group="3", contype="8", conaffinity="1",
                   friction="1.6 0.12 0.02", condim="3", margin="0.004",
                   solref="0.002 1", solimp="0.95 0.99 0.001")
     # The visible footrests reach the hull's front edge. These world-only
     # clearance shapes stop the hitch before a pedal can enter a wall.
-    for side, y in (("left", 0.14), ("right", -0.14)):
+    for side, y in (("left", 0.14 * cs), ("right", -0.14 * cs)):
         ET.SubElement(chair, "geom", name=f"wc_{side}_footrest_clearance",
-                      type="box", pos=fmt(0.48, y, 0.17), size="0.18 0.11 0.025",
+                      type="box", pos=fmt(0.48 * cs, y, 0.17 * cs),
+                      size=fmt(0.18 * cs, 0.11 * cs, 0.025 * cs),
                       rgba="0 0 0 0", group="3", density="0",
                       contype="8", conaffinity="1", margin="0.003")
     for joint in chair.iter("joint"):
@@ -318,7 +352,12 @@ def build(obstacle=False, config_path=None):
 
     actuator = ET.SubElement(root, "actuator")
     for act in robot.find("actuator"):
-        actuator.append(copy.deepcopy(act))
+        a = copy.deepcopy(act)
+        joint = base.find(f".//joint[@name='{a.get('joint')}']")
+        if joint is not None and joint.get("type") == "slide" and "ctrlrange" in a.attrib:
+            a.set("ctrlrange", fmt(*(float(v) * layout.ROBOT_SCALE
+                                    for v in a.get("ctrlrange").split())))
+        actuator.append(a)
     for act in wc.find("actuator"):
         a = prefix_names(copy.deepcopy(act), WC_PREFIX)
         a.set("class", "wheelchair")

@@ -60,7 +60,7 @@ from camera_rig import CameraRig, load_config
 from robot_base import Arms, BalanceBase, wrap
 from vision_navigation import VisionNavigator
 from voice_control import VoiceListener
-from push_wheelchair import PushController, ATTACH_STATES, LINEUP_STATES
+from push_wheelchair import PushController, ATTACH_STATES, LINEUP_STATES, HULL_SIDE_Y
 
 WORLD = "world.xml"
 GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82,
@@ -86,7 +86,14 @@ def main():
     ap.add_argument("--vision-config", help="camera and perception calibration JSON")
     ap.add_argument("--camera-preview", action="store_true", help="show all three RGB feeds and floor masks")
     ap.add_argument("--memory", default="memory/robot_map.npz", help="learned map file, loaded and saved automatically")
+    ap.add_argument("--tow-memory", default="memory/robot_map_tow.npz",
+                    help="separate learned map used whenever the wheelchair is attached - towing needs "
+                         "a wider clearance margin, so routes learned for it are kept apart from the "
+                         "plain-robot map instead of contaminating (or being constrained by) each other")
     ap.add_argument("--no-memory", action="store_true", help="run without loading or saving a map")
+    ap.add_argument("--attach", action="store_true",
+                    help="attach the wheelchair before starting (equivalent to pressing G at t=0); "
+                         "useful for training/testing navigation while towing, headless or not")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--seconds", type=float, default=60.0, help="headless run time")
     speed = ap.add_mutually_exclusive_group()
@@ -128,16 +135,20 @@ def main():
     # never fight over the same actuators; starts idle ("drive", unattached)
     # rather than the standalone demo's auto-attach-on-launch.
     push = PushController(model, data, base=base, arms=arms, start_state="drive")
+    if args.attach:
+        push.attach_chair()
     for entry in args.joint:
         name, _, value = entry.partition("=")
         arms.set(name.strip(), float(value))
     rig = CameraRig(model, config)
     memory_path = None if args.no_memory else args.memory
+    tow_memory_path = None if args.no_memory else args.tow_memory
     try:
         nav = VisionNavigator(config, room=room, goal=args.goal, memory_path=memory_path)
     except ValueError as error:
         rig.close()
         ap.error(str(error))
+    towing_nav_active = False   # which memory `nav` is currently pointed at
     autonomous = bool(room or args.goal is not None or args.explore)
     state = None
     last_narration = last_save = -100.0
@@ -156,15 +167,42 @@ def main():
                           debug=args.voice_debug) if args.voice else None
 
     def do_reset():
-        nonlocal nav, push, last_narration, last_save
+        nonlocal nav, push, towing_nav_active, last_narration, last_save
         nav.memory.save()
         reset(model, data, base)
         rig.reset()
         nav = VisionNavigator(config, memory_path=memory_path)
+        towing_nav_active = False
         # A physical reset snaps the chair back to its spawn pose too (part of
         # mj_resetData above); the grasp/hitch state has to restart to match.
         push = PushController(model, data, base=base, arms=arms, start_state="drive")
         last_narration = last_save = -100.0
+
+    def sync_tow_memory(pose):
+        """Swap `nav` onto the towing-specific memory the instant the chair
+        links, and back onto the plain memory the instant it releases -
+        towing needs a wider clearance margin (see set_towing), so routes
+        learned for it are kept in their own persisted map rather than
+        contaminating, or being constrained by, the plain-robot one.
+
+        The robot hasn't physically moved, only which map/landmark database
+        it should consult - so seed the new memory's alignment from the pose
+        it already knows (current `pose`, in the *old* memory's frame) rather
+        than forcing a blind re-localization turn, which would be risky this
+        close to whatever it was just doing (e.g. right after clamping the
+        handles, still near the wheelchair)."""
+        nonlocal nav, towing_nav_active
+        if push.linked == towing_nav_active:
+            return
+        known_pose = nav.current_pose
+        nav.memory.save()
+        towing_nav_active = push.linked
+        path = tow_memory_path if towing_nav_active else memory_path
+        nav = VisionNavigator(config, room=nav.room, goal=nav.local_goal, memory_path=path)
+        nav.memory.seed_pose(known_pose, pose)
+        which = "towing" if towing_nav_active else "plain"
+        print(f"t={data.time:.1f}s Switched to the {which} memory ({path}); "
+              f"{nav.map.seen.sum()} cells known there so far.", flush=True)
 
     def handle_voice_command(cmd):
         nonlocal autonomous, nav
@@ -196,8 +234,18 @@ def main():
             if cmd:
                 handle_voice_command(cmd)
         pose, frames = rig.sample(data)
+        sync_tow_memory(pose)
+        # (rear, front, side) in the robot's own frame: rear starts just past
+        # its own nose (real, still avoided), front reaches the chair's hull
+        # edge - covers the arms (extended forward reaching for/gripping the
+        # handles, from arm_pregrasp through drive-while-linked) as well as
+        # the chair itself, both otherwise misread as a wall by the forward
+        # camera (see set_tow_footprint / PushController.tow_exclusion_front_x).
+        front_x = push.tow_exclusion_front_x()
+        nav.set_tow_footprint((0.15, front_x, max(HULL_SIDE_Y, 0.35)) if front_x is not None else None)
         if frames is not None:
             nav.observe(frames, pose)
+            nav.set_towing(push.linked)
             if not base.fallen:
                 if push.state in ATTACH_STATES:
                     push.decide()   # lining up / reaching / clamping owns the base+arms
@@ -222,7 +270,7 @@ def main():
                       f"Mapped {nav.map.seen.sum()*config['resolution']**2:.1f} square metres.", flush=True)
             if data.time-last_save >= 15:
                 if nav.memory.save():
-                    print(f"t={data.time:.1f}s Saved learned map to {memory_path}.", flush=True)
+                    print(f"t={data.time:.1f}s Saved learned map to {nav.memory.path}.", flush=True)
                 last_save = data.time
             if args.camera_preview:
                 import cv2
@@ -237,18 +285,15 @@ def main():
                 cv2.waitKey(1)
         if data.time - nav.last_frame > 0.5:
             base.stop()
-        arms.step()
-        base.step()
-        # Keep the chair glued to the robot (no-op unless actually linked) and
-        # roll back any planar step that would clip a chair part through a
-        # wall. Chair-contact jostling can otherwise register as a fall;
-        # only forgive that while the wheelchair mechanism is actually in
-        # play; a real fall during ordinary navigation still needs 'r'.
-        push.apply_hitch()
-        push.block_wall_clip()
-        if (push.linked or push.state in ATTACH_STATES) and base.fallen:
-            base.fallen = False
-            base.reset_targets()
+        # The standalone grasp demo and the main app share exactly the same
+        # physics, attachment, collision and transform update sequence.
+        push.step()
+        if push.collided:
+            # The chair just actually hit something (push.step()'s
+            # block_wall_clip rolled the pose back) - tell nav so a blind
+            # in-place SCANNING turn tries the other direction next tick
+            # instead of grinding against the same spot again.
+            nav.notify_collision(data.time)
 
     def on_key(keycode):
         nonlocal autonomous, nav, last_narration, last_save
@@ -334,7 +379,7 @@ def main():
         try:
             if nav.memory.save():
                 print(f"Saved {nav.map.seen.sum()} learned cells, {len(nav.memory.landmarks)} localization landmarks "
-                      f"and {len(nav.memory.rooms)} rooms to {memory_path}.", flush=True)
+                      f"and {len(nav.memory.rooms)} rooms to {nav.memory.path}.", flush=True)
         finally:
             rig.close()
             if voice is not None:

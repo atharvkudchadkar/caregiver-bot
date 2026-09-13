@@ -7,6 +7,10 @@ unchanged.
 
 ## Run
 
+For the independent Quest headset view, arm controls, and joystick driver, see
+[VR_TELEOP.md](VR_TELEOP.md). Launch it with `python quest_teleop.py`; it uses
+the same world file in its own process and leaves `run_world.py` unchanged.
+
 From this directory with Python 3.12 or 3.13:
 
 ```powershell
@@ -45,6 +49,26 @@ python build_world.py --obstacle
 human's overview camera is never a navigation input. Headless mode still needs
 an OpenGL context for RGB rendering. On macOS use `mjpython` for the interactive
 viewer. The older `mujoco/run_balance.py` and `build_scene.py` are separate demos.
+
+## Robot size and wheelchair attachment
+
+The complete robot is built at 70% of its original dimensions (meshes, joints,
+grippers and collision shapes); the wheelchair remains at 60%. The camera
+mounts and wheel odometry calibration in `vision_config.json` match this size.
+Rebuild with `python build_world.py` before launching an updated simulation.
+
+Press **G** to approach and grasp the wheelchair, then use the arrow keys to
+drive the attached pair; **X** releases it. `python run_world.py --attach`
+starts the grasp immediately. This grasp controller currently uses the
+simulator's known wheelchair pose. After both hands verify handle contacts,
+a planar simulated hitch maintains the chair's relative position and heading
+while allowing the robot to balance. The same hitch update runs in the main
+app and `push_wheelchair.py`; it is a simulated attachment, not a model of load
+transfer through the hands. Navigation still uses the camera-based learned map.
+
+Run `python -m unittest discover -s tests -p test_wheelchair.py -v` to check
+whole-robot scaling, grasping from the normal spawn, forward/reverse towing,
+turning, and release.
 
 ## Doorway signs
 
