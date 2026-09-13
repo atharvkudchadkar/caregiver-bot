@@ -1,200 +1,199 @@
 # Bracket Bot: camera navigation with learned memory
 
-The active simulator is `build_world.py` + `run_world.py`. It uses the head and
-both hand RGB cameras, wheel encoders and IMU tilt. The robot learns the visible
-layout as it moves and saves it between runs. Joint and balancing controls are
-unchanged.
-
-## Run
-
-For the independent Quest headset view, arm controls, and joystick driver, see
-[VR_TELEOP.md](VR_TELEOP.md). Launch it with `python quest_teleop.py`; it uses
-the same world file in its own process and leaves `run_world.py` unchanged.
-
-From this directory with Python 3.12 or 3.13:
+A balancing two-wheel robot that navigates an apartment using only onboard RGB
+cameras, wheel encoders and IMU tilt, plus a known-pose wheelchair grasp/tow
+controller. There are two independent ways to run it: the main `run_world.py`
+demo (autonomous navigation, voice control, manual driving) and a standalone
+Meta Quest VR teleoperation mode. They share the same `world.xml` but run as
+separate processes and never communicate with each other.
 
 ```powershell
 python -m pip install -r requirements.txt
 python build_world.py
-python run_world.py --explore --camera-preview
-python run_world.py --goto bathroom --camera-preview
 ```
 
-## Meta Quest VR mode
+Run that once (and again after any change to `layout.py` or `vision_config.json`)
+before either mode below. Requires Python 3.12 or 3.13.
 
-VR runs as a separate simulation and does not start or communicate with
-`run_world.py`. Enable Developer Mode for the Quest, connect it with a USB data
-cable, accept USB debugging in the headset, and verify that `adb devices` lists
-it as `device`. Then run:
+## 1. `run_world.py` demo
+
+This is the main simulator: camera-based autonomous navigation, learned
+persistent memory, optional voice control, and manual/teleop driving,
+including towing the wheelchair.
 
 ```powershell
-adb reverse tcp:8765 tcp:8765
-python build_world.py
-python quest_teleop.py
+python run_world.py                            # viewer; arrow keys drive, space stops
+python run_world.py --explore --camera-preview # autonomously explore and map
+python run_world.py --goto kitchen             # navigate to a learned room
 ```
 
-Open `http://127.0.0.1:8765` in Quest Browser, confirm the live head-camera
-preview, and select **Enter VR and connect**. The left thumbstick drives forward
-and backward. Turning your head swivels the robot through the same relative yaw
-angle; the right thumbstick does not steer. Moving each controller moves the
-matching arm. Press either rear grip within 2 metres of the wheelchair to align
-with its orientation and attach both hands to its handles; press again to
-release it. Every arm link collides with the complete wheelchair in VR mode.
+### Navigation quality: this needs training first
 
-If VR immediately closes, restart `quest_teleop.py`, reload the page, and watch
-the terminal for lines beginning with `Quest Browser:`. A successful connection
-ends with `Immersive session, render layer, and local tracking are ready.` See
-[VR_TELEOP.md](VR_TELEOP.md) for full setup, controls, and troubleshooting.
+The robot has **no preloaded floor plan**. On an empty memory file it only
+knows the small footprint disk under its own wheels - everything else starts
+unseen, and unseen space is never treated as safe to drive through. To get
+navigation that looks as smooth as a demo video, the map needs to already be
+populated, in one of two ways:
 
-The default memory file is `memory/robot_map.npz`. It is loaded automatically,
-autosaved every 15 simulated seconds, and saved on normal exit or Ctrl+C. Use
-`--memory memory/another_building.npz` for a different environment. A missing
-file starts with an empty map except the robot's current footprint; there is
-no preloaded apartment layout. `--no-memory` disables both loading and saving.
-Generated memory, verification reports and marker textures are not committed.
+- **Let it train itself.** Run with `--explore` (or `--goto <room>`) repeatedly
+  so it wanders, scans for room signs, and builds up the occupancy grid and
+  learned routes over time. This takes real wall-clock/simulated time - the
+  first run through a new room is always the slowest and most hesitant one,
+  since it's making the map as it goes rather than following it.
+- **Drive an expert pass yourself.** Take manual control (arrow keys) and
+  drive through the apartment once. `nav.observe()` runs identically no
+  matter who's driving, so a human-driven pass populates the exact same
+  occupancy grid, landmarks and room targets that autonomous exploration
+  would - just faster and without any risk of it getting stuck on a route a
+  person could see is fine. Autonomous runs afterward reuse that memory.
 
-The terminal explains the robot's current action at state changes and every
-five simulated seconds: searching for a room, rotating to inspect an area,
-following a learned route, replanning after an obstacle, waiting for camera
-coverage, or stopping. It also reports newly learned localization landmarks,
-read English signs, mapped area, successful relocalization and memory saves.
+Either way, once a room/route has been driven at least once and saved to
+memory, later runs navigate it far more directly - only genuinely new areas
+still require the slower explore-and-learn behavior.
 
-Arrow keys drive/turn, Space stops, and R resets the physical robot while
-preserving learned memory. Pressing an arrow key takes over from autonomous
-navigation. After reset/restart, the robot must relocalize before translating
-on the saved map. Manual rotation remains available for finding a code.
+### Extra features (`run_world.py` flags)
+
+Destination (pick at most one; default is manual control only):
+
+| Flag | Effect |
+| --- | --- |
+| `--goto ROOM` | Navigate to a learned room by name, exploring first if it hasn't been visited yet |
+| `--goal X Y` | Navigate to a fixed point, in metres, relative to the startup pose (X forward, Y left) |
+| `--explore` | Autonomously explore visible free space with no fixed destination |
+
+Voice control:
+
+| Flag | Effect |
+| --- | --- |
+| `--voice` | Listen on the microphone for spoken commands (see below) |
+| `--voice-device` | Microphone index or name substring (default: system default mic) |
+| `--voice-model` | faster-whisper model size (default: `small`) |
+| `--voice-threshold` | Manual noise-gate level (default: auto-calibrated from 1s of room noise at startup) |
+| `--voice-debug` | Print a live mic level meter, to help tune detection |
+
+Spoken commands, once `--voice` is on: *"go to \<room\>"*, *"explore"*,
+*"come home"* / *"go home"*, *"stop"*, *"reset"*, *"grab/attach the
+wheelchair"*, *"let go/detach the wheelchair"*.
+
+Wheelchair towing:
+
+| Flag | Effect |
+| --- | --- |
+| `--attach` | Attach the wheelchair before starting, equivalent to pressing **G** at t=0 |
+| `--tow-memory PATH` | Separate learned map used only while towing (default `memory/robot_map_tow.npz`) - towing needs wider clearance, so its routes are kept apart from the plain-robot map |
+
+Memory:
+
+| Flag | Effect |
+| --- | --- |
+| `--memory PATH` | Learned map file, loaded and saved automatically (default `memory/robot_map.npz`) |
+| `--no-memory` | Run without loading or saving a map at all |
+
+Playback/viewer speed:
+
+| Flag | Effect |
+| --- | --- |
+| `--real-time` | Cap the viewer to 1x wall-clock speed |
+| `--speed X` | Fixed wall-clock speed multiplier, e.g. `--speed 4` (default: uncapped) |
+| `--speed-slider` | Open a window with a live slider (0.1x-20x, or an "uncapped" checkbox) to change speed while it's running |
+
+Other:
+
+| Flag | Effect |
+| --- | --- |
+| `--camera-preview` | Show all three RGB feeds and the floor classifier mask |
+| `--headless` / `--seconds N` | Run without a viewer for N wall-clock seconds (still needs an OpenGL context to render) |
+| `--joint NAME=VALUE` | Set an arm/lift/gripper target directly, repeatable |
+| `--vision-config PATH` | Alternate camera/perception calibration JSON |
+| `--world PATH` | Alternate world XML (default `world.xml`) |
 
 ```powershell
 python run_world.py --goto kitchen --headless --seconds 300
 python run_world.py --goal 1 0 --headless --seconds 15 --no-memory
 python run_world.py --joint rj1=0.4 --joint lj6=-0.3 --joint gripper_right=0.8
-python build_world.py --obstacle
+python run_world.py --voice --voice-device 1 --voice-debug
+python run_world.py --attach --speed-slider
 ```
 
-`--goal X Y` uses startup-local coordinates: X forward, Y left, metres. The
-human's overview camera is never a navigation input. Headless mode still needs
-an OpenGL context for RGB rendering. On macOS use `mjpython` for the interactive
-viewer. The older `mujoco/run_balance.py` and `build_scene.py` are separate demos.
+### Manual controls (viewer window must have focus)
 
-## Robot size and wheelchair attachment
+| Key | Action |
+| --- | --- |
+| Up / Down | +/- 0.1 m/s forward speed |
+| Left / Right | +/- 0.3 rad/s turn rate |
+| Space | Stop |
+| R | Reset to spawn pose (keeps learned memory) |
+| G | Line up on the wheelchair and clamp its handles (known pose, not vision) |
+| X | Release the wheelchair clamp |
 
-The complete robot is built at 70% of its original dimensions (meshes, joints,
-grippers and collision shapes); the wheelchair remains at 60%. The camera
-mounts and wheel odometry calibration in `vision_config.json` match this size.
-Rebuild with `python build_world.py` before launching an updated simulation.
+Pressing any arrow key takes over from autonomous navigation immediately.
+While **G** is lining up, arrows nudge the approach manually and Space resumes
+automatic alignment. Once clamped, the chair drives as one body with the
+robot until **X** releases it. After a reset/restart, the robot must
+relocalize (see a known landmark) before it will trust the saved map enough
+to translate on it - manual rotation to find a sign always still works.
 
-Press **G** to approach and grasp the wheelchair, then use the arrow keys to
-drive the attached pair; **X** releases it. `python run_world.py --attach`
-starts the grasp immediately. This grasp controller currently uses the
-simulator's known wheelchair pose. After both hands verify handle contacts,
-a planar simulated hitch maintains the chair's relative position and heading
-while allowing the robot to balance. The same hitch update runs in the main
-app and `push_wheelchair.py`; it is a simulated attachment, not a model of load
-transfer through the hands. Navigation still uses the camera-based learned map.
+### Memory, room signs and other details
 
-Run `python -m unittest discover -s tests -p test_wheelchair.py -v` to check
-whole-robot scaling, grasping from the normal spawn, forward/reverse towing,
-turning, and release.
+- The default memory file is `memory/robot_map.npz` (or `robot_map_tow.npz`
+  while towing). It's loaded automatically, autosaved every 15 simulated
+  seconds, and saved on normal exit or Ctrl+C. A missing file starts empty,
+  with no preloaded apartment layout. Generated memory, verification
+  reports and marker textures are not committed to the repo.
+- Each room has two signs by its entrance (one facing in, one facing the
+  hallway), each with a distinct ArUco code, the English room name, and
+  either INSIDE or ENTRANCE. Codes carry no room names or coordinates -
+  `room_signs.py` estimates 3-D pose from pixels and PnP, and English text
+  is read separately with a small vocabulary/font recognizer, not general OCR.
+- The robot remembers observed free space/obstacles, exploration visits,
+  motion-derived route connections, localization landmarks, and room
+  names/targets. Room dimensions, doors and corridors are never passed to
+  the navigator directly - only what the cameras actually saw.
+- The floor classifier uses relative colour contrast and ground-plane
+  projection, not learned depth; it's calibrated to the demo's neutral
+  checker floor. `vision_config.json` holds camera mounts, resolution/FOV,
+  marker size and grid settings - rebuild the world after changing it.
+- The complete robot is built at 70% scale, the wheelchair at 60%; both are
+  set in `layout.py` and matched in `vision_config.json`.
 
-## Doorway signs
+Tests: `python -m unittest discover -s tests -v`. Independent navigation
+verification: `python verify_navigation.py --room bathroom --seconds 180
+--output verification/bathroom --memory memory/test_map.npz`.
 
-Each room has two signs at the front wall beside its entrance: one facing the
-room, one facing the hallway. Each contains a distinct ArUco code, the English
-room name, and either INSIDE or ENTRANCE. There are no floor-code mats.
+## 2. Meta Quest VR teleoperation
 
-Codes carry **no room names or coordinates**. `room_signs.py` estimates their
-3-D position/orientation from pixels, camera calibration and the printed marker
-size. English text is recognized separately after perspective rectification.
-The room name and side line must both be readable, and repeated readings are
-required before remembering a semantic label. An obscured line is not inferred
-from the code. This is a small vocabulary/font template recognizer for the
-provided signs, not unrestricted OCR.
-
-## What the robot remembers
-
-- Camera-observed free space, obstacles and unknown areas in an occupancy grid.
-- Exploration visits, so already examined areas can be deprioritized.
-- Motion-derived route connections: cells the robot actually traveled through,
-  recorded separately from exploration scores. These guide return trips when
-  noisy occupancy observations temporarily disconnect a remembered doorway.
-- Localization landmarks and their observed poses in the learned map frame.
-- English room names, the observed signs associated with them, and room-side
-  floor or previously visited destination positions.
-
-Doorway approaches are derived from observed free floor on the interior side of
-a sign's wall. Room dimensions, door coordinates and corridor routes are never
-passed to the navigator. Dijkstra planning runs on the learned grid with base
-clearance; occupied and unknown space are not traversable. Exploration aims for
-visible free/unknown boundaries, not unknown space hidden behind a wall.
-
-On a later run, the robot loads its memory but **does not assume the same start
-position**. It waits for consistent observations of a saved landmark, aligns the
-new odometry frame with the saved map, then navigates using memory and live
-cameras. Codes can leave view after this alignment. Later sightings provide
-bounded odometry-drift corrections. If a saved landmark cannot be found, the
-robot stops after a scan and leaves the stored map untouched. This does not
-provide global visual SLAM or relocalization in a completely unfamiliar part of
-the building; a recognizable saved landmark is needed to initialize a reused map.
-
-Memory uses a versioned, non-pickle NPZ archive with JSON metadata and atomic
-file replacement. Corrupt/incompatible archives produce an error rather than
-silently discarding learned data. Keep separate files for different buildings
-or materially changed sign arrangements.
-
-## Sensor and implementation boundary
-
-`vision_navigation.py`, `navigation_memory.py` and `room_signs.py` do not import
-MuJoCo or the apartment's `layout.py`. They receive RGB, camera calibration and
-local odometry, not world positions, room geometry, LiDAR, depth buffers,
-collision/contact data or simulator segmentation. `layout.py` is used only by
-the world builder and the independent verification evaluator.
-
-`camera_rig.py` renders exactly three robot RGB feeds. Hand cameras are attached
-to their hand bodies. Articulated camera transforms are calculated from joint
-encoders in a separate local FK state with global translation/yaw removed. IMU
-tilt supplies gravity alignment; wheel encoders supply navigation odometry.
-The balance controller independently uses simulator state to keep the base upright.
-
-## Calibration and limits
-
-`vision_config.json` sets the camera mounts, 480?360 RGB at 8 Hz, 80? vertical
-FOV, printed marker size, wheel dimensions, floor classifier and grid settings.
-After changing mounts/FOV, rebuild the world with the same `--vision-config`.
-The head looks toward the wall signs while the hand cameras provide nearer
-floor coverage. Mount positions remain approximate until hardware measurements
-are supplied.
-
-The floor classifier is calibrated to the demo's neutral checker floor. It uses
-relative colour contrast to distinguish it from shaded walls, projects visible
-ground to a flat plane, and uses bottom silhouettes for obstacles. This is not
-learned monocular depth. Similar-coloured obstacles, transparency, difficult
-lighting, slopes and drop-offs require stronger perception. A 0.28 m base
-clearance does not model the swept volume of extended arms. The map spans
-30?30 m at 0.1 m resolution. Encoder slip and imperfect landmark pose estimates
-can still affect mapping; memory is not a guarantee that old space stays clear.
-Live camera observations continue to update obstacles and trigger replanning.
-
-## Verification
+A separate, standalone simulation for driving the robot directly from a Quest
+headset - its own process, own physics state, does not start, import, or
+communicate with `run_world.py`, and doesn't read or write navigation memory.
 
 ```powershell
-python -m unittest discover -s tests -v
-python verify_navigation.py --room bathroom --seconds 180 --output verification/bathroom --memory memory/test_map.npz
-python verify_navigation.py --room bedroom --spawn -3.5 2.2 -90 --output verification/restart --memory memory/test_map.npz
+adb devices                     # confirm the headset shows as "device"
+adb reverse tcp:8765 tcp:8765
+python build_world.py           # only if world.xml doesn't exist yet
+python quest_teleop.py
 ```
 
-The evaluator saves a JSON result, trajectory, terminal narration, three camera
-images and a learned-map image. Ground truth is used only in this evaluator to
-check whether the robot actually entered the requested room, stayed upright,
-and avoided non-floor contacts. A controller ARRIVED message alone is not a pass.
-Unit/integration tests also cover memory round trips, relocalization from a
-changed starting position, ID-independent English text, unreadable signs,
-corrupt archives, articulated cameras, dynamic obstacles and local goal motion.
+Enable Developer Mode on the Quest, connect it over USB, and accept USB
+debugging in the headset first. Then in **Quest Browser on the headset**,
+open `http://127.0.0.1:8765`, confirm the live head-camera preview is
+updating, and select **Enter VR and connect**.
 
-Remembered motion is only a planning guide: every local segment is still checked
-against the camera-updated occupancy grid. It does not override a newly observed
-obstacle. On first arrival the robot scans to learn inside-facing landmarks for
-future restarts. The supplied default memory was learned during the verification
-runs; use a different, nonexistent `--memory` filename to watch learning from scratch.
+| Input | Robot action |
+| --- | --- |
+| Left thumbstick up/down | Drive forward/backward |
+| Turn your head left/right | Swivel the robot to the same relative yaw angle |
+| Controller position | Move the matching hand relative to the robot's head |
+| Controller rotation | Rotate the matching gripper |
+| Either rear grip, within 2m of the chair | Align to it and attach both hands to its handles |
+| Rear grip again, while attached | Release the wheelchair |
+| Either thumbstick click | Recalibrate head steering / gripper orientation |
 
-Implementation references: [OpenCV marker pose estimation](https://docs.opencv.org/4.10.0/d5/d1f/calib3d_solvePnP.html)
-and [MuJoCo rendering](https://mujoco.readthedocs.io/en/stable/programming/visualization.html).
+The right thumbstick does not steer. The single head camera is shown to both
+eyes as a flat, monoscopic view - no synthetic stereo. If input stops arriving
+for 350 ms or tracking is lost, driving stops and the arms hold their pose.
+
+If VR immediately closes, restart `quest_teleop.py`, reload the page, and
+watch the terminal for lines starting with `Quest Browser:` - a successful
+connection ends with `Immersive session, render layer, and local tracking are
+ready.` Useful options: `--arm-scale`, `--headless --seconds N`, `--port`.
+Full setup, troubleshooting and implementation notes: [VR_TELEOP.md](VR_TELEOP.md).
