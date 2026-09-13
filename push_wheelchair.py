@@ -1,8 +1,11 @@
 """Camera-guided, empty-wheelchair grasp and short push in MuJoCo.
 
-Run: python3 push_wheelchair.py [--headless] [--seconds 30]
+Run: python3 push_wheelchair.py [--headless] [--seconds 45]
 The rear ArUco marker supplies the chair pose; the known offsets from that
-marker supply handle targets. This is a simulation demo, not a hardware driver.
+marker supply the two handle *tips*. Each hand approaches end-on so the
+open clamp faces the tip; closing the gripper joint pinches it. Arms are
+driven through the XML position actuators. This is a simulation demo, not
+a hardware driver.
 """
 import argparse
 import math
@@ -22,14 +25,18 @@ from run_world import Arms, BalanceBase, wrap
 
 
 HEIGHT, WIDTH = 360, 480
-MARKER_TO_HANDLE_X = -0.119  # handle grip is 119 mm behind the marker face
+MARKER_TO_TIP = -0.181  # handle tip is 181 mm behind the marker face
 PUSH_SPEED = 0.04
 PUSH_SECONDS = 4.0
-ARM_SETUP_LATERAL = 0.14
-BASE_SLIDE_DISTANCE = 0.14
+ARM_SETUP_BACKOFF = 0.07   # open jaws hover this far behind the tip
+BASE_SLIDE_DISTANCE = 0.07  # must match backoff so the tip actually enters the jaws
+APPROACH_STANDOFF = 0.50
+ARM_SETTLE_S = 8.0
+CLOSE_SETTLE_S = 5.0
+VERIFY_SETTLE_S = 4.0
 OPEN_GRIP = 1.0
 CLOSED_GRIP = {"right": 0.14, "left": 0.0}
-PAD_CENTER_OFFSET = 0.028  # 21 mm rubber radius + 6 mm pad half-thickness + 1 mm clearance
+PAD_CENTER_OFFSET = 0.021  # 13 mm tip half-thickness + 6 mm pad + 2 mm clearance
 
 
 def obj_id(model, kind, name):
@@ -112,18 +119,25 @@ class MarkerDetector:
 
 
 def handle_targets(marker_pose):
+    """World points of the two handle tips (the free ends that face the robot)."""
     center, x_axis, y_axis = marker_pose
-    # The rendered marker face backprojects about 8 mm above its model site at
-    # this oblique head-camera angle; compensate before aligning the jaw pads.
-    common = center + MARKER_TO_HANDLE_X * x_axis + np.array([0, 0, 0.116])
+    # The rendered marker face backprojects a little high at this camera angle.
+    common = center + MARKER_TO_TIP * x_axis + np.array([0, 0, 0.116])
     return {"right": common - 0.18 * y_axis, "left": common + 0.18 * y_axis}
 
 
 def solve_grasp_ik(model, data, targets, handle_axis):
-    """Align both finger pads around each horizontal tube, using all 7 arm joints."""
+    """Put the jaw pads above and below each handle tip (the grasp that worked).
+
+    Closing the gripper joint then pinches the stub. The earlier end-on wrist
+    residual pulled the hands into poses where the pads missed the handle, so
+    the servo just ran to fully closed.
+    """
     trial = mujoco.MjData(model)
     trial.qpos[:] = data.qpos
     result = {}
+    up = np.array([0.0, 0.0, 1.0])
+    axis = handle_axis / max(np.linalg.norm(handle_axis), 1e-9)
     for side, prefix in (("right", "rj"), ("left", "lj")):
         joints = [obj_id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{prefix}{i}") for i in range(7)]
         qadr = model.jnt_qposadr[joints]
@@ -136,7 +150,7 @@ def solve_grasp_ik(model, data, targets, handle_axis):
             joint = obj_id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             trial.qpos[model.jnt_qposadr[joint]] = CLOSED_GRIP[side]
         start = np.clip(data.qpos[qadr], lo, hi)
-        up = np.array([0.0, 0.0, 1.0])
+        tip = targets[side]
 
         def residual(q):
             trial.qpos[qadr] = q
@@ -145,12 +159,12 @@ def solve_grasp_ik(model, data, targets, handle_axis):
             low_R = trial.site_xmat[lower].reshape(3, 3)
             high_R = trial.site_xmat[upper].reshape(3, 3)
             return np.r_[
-                12 * (low_pos - (targets[side] - PAD_CENTER_OFFSET * up)),
-                12 * (high_pos - (targets[side] + PAD_CENTER_OFFSET * up)),
+                12 * (low_pos - (tip - PAD_CENTER_OFFSET * up)),
+                12 * (high_pos - (tip + PAD_CENTER_OFFSET * up)),
                 1.5 * (low_R[:, 2] - up),
                 1.5 * (high_R[:, 2] + up),
-                0.5 * np.cross(low_R[:, 0], handle_axis),
-                0.5 * np.cross(high_R[:, 0], handle_axis),
+                0.5 * np.cross(low_R[:, 0], axis),
+                0.5 * np.cross(high_R[:, 0], axis),
                 0.01 * (q - start),
             ]
 
@@ -163,9 +177,39 @@ def solve_grasp_ik(model, data, targets, handle_axis):
             if best is None or error < best[0]:
                 best = (error, candidate.x)
         if best[0] > 0.02:
-            raise RuntimeError(f"{side} pads cannot surround handle ({best[0]:.3f} m IK error)")
+            raise RuntimeError(f"{side} pads cannot surround handle tip ({best[0]:.3f} m IK error)")
         result.update({f"{prefix}{i}": float(q) for i, q in enumerate(best[1])})
     return result
+
+
+def stiffen_grasp_servos(model, arms):
+    """Give the placeholder arm inertias enough armature that a position servo
+    can close a finger without sending QACC to infinity.
+
+    The stock XML (kp=0.03, mass ~5e-5 kg) cannot squeeze a handle. The first
+    attempt (kp=12, ±6 N·m) blew up DOF 13 on the first contact. Navigation
+    still uses the XML values; this only retunes the in-memory model.
+    """
+    for name, aid in arms.act.items():
+        jid = int(model.actuator_trnid[aid, 0])
+        dadr = model.jnt_dofadr[jid]
+        if "gripper" in name:
+            kp, kv, force, rate = 0.8, 0.08, 0.5, 0.8
+            armature, damping = 0.008, 0.15
+        elif name.endswith("0"):
+            kp, kv, force, rate = 2.0, 0.3, 1.0, 0.2
+            armature, damping = 0.02, 0.4
+        else:
+            kp, kv, force, rate = 0.4, 0.06, 0.4, 0.5
+            armature, damping = 0.006, 0.08
+        model.dof_armature[dadr] = max(float(model.dof_armature[dadr]), armature)
+        model.dof_damping[dadr] = max(float(model.dof_damping[dadr]), damping)
+        model.actuator_gainprm[aid, 0] = kp
+        model.actuator_biasprm[aid, 1] = -kp
+        model.actuator_biasprm[aid, 2] = -kv
+        model.actuator_forcerange[aid] = (-force, force)
+        model.actuator_forcelimited[aid] = 1
+        arms.ramp[name] = rate
 
 
 class PushController:
@@ -173,6 +217,8 @@ class PushController:
         self.model, self.data = model, data
         self.base = BalanceBase(model, data)
         self.arms = Arms(model, data)
+        stiffen_grasp_servos(model, self.arms)
+        self.arms.hold_current()
         self.detector = MarkerDetector(model)
         self.state = "find"
         self.last_seen = -1.0
@@ -183,37 +229,23 @@ class PushController:
                            for side in ("right", "left")}
         self.pad_site = {(side, jaw): obj_id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_{jaw}_pad_site")
                          for side in ("right", "left") for jaw in ("lower", "upper")}
-        self.pad_geom = {(side, jaw): obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_{jaw}_pad")
-                         for side in ("right", "left") for jaw in ("lower", "upper")}
-        self.handle_geoms = {side: {obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"wc_{side}_handle_grip"),
-                                    obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"wc_{side}_push_handle")}
+        self.finger_geoms = {(side, jaw): {obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_{jaw}_pad")}
+                             for side in ("right", "left") for jaw in ("lower", "upper")}
+        self.handle_geoms = {side: {obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, f"wc_{side}_{part}")
+                                    for part in ("handle_tip", "handle_grip", "push_handle")}
                              for side in ("right", "left")}
-        self.all_handles = set().union(*self.handle_geoms.values())
-        self.blocking_geoms = {g for g in range(model.ngeom)
-                               if model.geom_contype[g] in (1, 4)
-                               and not (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY,
-                                                           model.geom_bodyid[g]) or "").startswith("wc_")}
         self.handle_site = {side: obj_id(model, mujoco.mjtObj.mjOBJ_SITE, f"wc_{side}_handle_grasp")
-                            for side in ("right", "left")}
-        self.constraints = {side: obj_id(model, mujoco.mjtObj.mjOBJ_EQUALITY, f"{side}_wheelchair_grasp")
                             for side in ("right", "left")}
         self.chair_body = obj_id(model, mujoco.mjtObj.mjOBJ_BODY, "wc_wheelchair")
         self.arm_pose = {}
-        self.arm_start = {}
-        self.finger_dofs = {side: [(model.jnt_qposadr[j], model.jnt_dofadr[j])
-                                   for finger in ("left", "right")
-                                   for j in [obj_id(model, mujoco.mjtObj.mjOBJ_JOINT,
-                                                    f"{side}_{finger}_gripper")]]
-                            for side in ("right", "left")}
-        self.pad_finger_dofs = {
-            (side, "lower"): self.finger_dofs[side][0]
-            for side in ("right", "left")
+        self.arm_names = [f"{p}{i}" for p in ("rj", "lj") for i in range(7)]
+        self.grip_joint = {
+            ("right", "lower"): "right_left_gripper",
+            ("right", "upper"): "right_right_gripper",
+            ("left", "lower"): "left_left_gripper",
+            ("left", "upper"): "left_right_gripper",
         }
-        self.pad_finger_dofs.update({
-            (side, "upper"): self.finger_dofs[side][1]
-            for side in ("right", "left")
-        })
-        self.contact_latched = set()
+        self.grip_latched = set()
         self.clamp_since = None
 
     def change(self, state):
@@ -222,60 +254,26 @@ class PushController:
             self.push_base_start = np.array(self.base.pose()[:2])
             self.push_chair_start = self.data.xpos[self.chair_body, :2].copy()
         if state == "close":
-            self.contact_latched.clear()
+            self.grip_latched.clear()
         if state == "verify":
             self.clamp_since = None
         print(f"{self.data.time:.1f}s: {state}", flush=True)
 
-    def apply_prescribed_pose(self):
-        if not self.arm_pose or self.state not in ("arm_pregrasp", "move_in", "close", "verify", "push", "done"):
-            return
-        d = self.data
-        qpos_before = d.qpos.copy()
-        qvel_before = d.qvel.copy()
-        arm_fraction = np.clip((d.time - self.state_start) / 4, 0, 1) if self.state == "arm_pregrasp" else 1
-        for name, (qadr, dadr, target) in self.arm_pose.items():
-            d.qpos[qadr] = self.arm_start[name] + arm_fraction * (target - self.arm_start[name])
-            d.qvel[dadr] = 0
-        for side in ("right", "left"):
-            close_fraction = np.clip((d.time - self.state_start) / 2, 0, 1) if self.state == "close" else 0
-            for jaw in ("lower", "upper"):
-                qadr, dadr = self.pad_finger_dofs[(side, jaw)]
-                value = OPEN_GRIP - close_fraction * (OPEN_GRIP - CLOSED_GRIP[side])
-                if self.state in ("verify", "push", "done"):
-                    value = CLOSED_GRIP[side]
-                if (side, jaw) in self.contact_latched:
-                    value = float(d.qpos[qadr])
-                d.qpos[qadr], d.qvel[dadr] = value, 0
-        mujoco.mj_forward(self.model, d)
-        if self.state == "close":
-            for key, pad in self.pad_geom.items():
-                side, _ = key
-                if any(pad in {contact.geom1, contact.geom2}
-                       and {contact.geom1, contact.geom2}.intersection(self.handle_geoms[side])
-                       and contact.dist <= 0 for contact in d.contact):
-                    self.contact_latched.add(key)
-        violation = self.handle_penetration()
-        if violation:
-            d.qpos[:] = qpos_before
-            d.qvel[:] = qvel_before
-            mujoco.mj_forward(self.model, d)
-            print(f"blocked arm motion through handle: {violation}", flush=True)
-            self.change("failed")
-
-    def handle_penetration(self):
-        """Reject deep non-grasp collisions before committing prescribed motion."""
-        for contact in self.data.contact:
-            pair = {contact.geom1, contact.geom2}
-            if not pair.intersection(self.all_handles):
+    def hold_grippers_on_contact(self):
+        """Stop driving a jaw through the handle as soon as that pad touches it."""
+        _, contacts = self.clamp_status(min_contacts=1, xy_tolerance=0.06,
+                                        z_tolerance=0.05, require_all=False)
+        for key, count in contacts.items():
+            if count < 1 or key in self.grip_latched:
                 continue
-            other = next(iter(pair - self.all_handles), None)
-            if other in self.blocking_geoms and contact.dist < -0.003:
-                return (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, other),
-                        float(contact.dist))
-        return None
+            name = self.grip_joint[key]
+            aid = self.arms.act[name]
+            q = float(self.data.qpos[self.model.jnt_qposadr[int(self.model.actuator_trnid[aid, 0])]])
+            self.arms.set(name, q)
+            self.grip_latched.add(key)
+            print(f"  {key} pad hit the handle; holding gripper at {q:.2f}", flush=True)
 
-    def clamp_status(self, min_contacts=1, xy_tolerance=0.015, z_tolerance=0.012,
+    def clamp_status(self, min_contacts=1, xy_tolerance=0.025, z_tolerance=0.015,
                      require_all=True):
         """Require opposing pad-to-handle contacts and near-horizontal faces."""
         d = self.data
@@ -284,9 +282,9 @@ class PushController:
             pair = {contact.geom1, contact.geom2}
             if contact.dist > 0:
                 continue
-            for key, pad in self.pad_geom.items():
+            for key, geoms in self.finger_geoms.items():
                 side, _ = key
-                if pad in pair and pair.intersection(self.handle_geoms[side]):
+                if pair.intersection(geoms) and pair.intersection(self.handle_geoms[side]):
                     contacts[key] += 1
         for side in ("right", "left"):
             handle = d.site_xpos[self.handle_site[side]]
@@ -296,7 +294,7 @@ class PushController:
                 normal = d.site_xmat[self.pad_site[key]].reshape(3, 3)[:, 2]
                 if (contacts[key] < min_contacts or np.linalg.norm(pos[:2] - handle[:2]) > xy_tolerance
                         or abs((pos[2] - handle[2]) - sign * PAD_CENTER_OFFSET) > z_tolerance
-                        or sign * normal[2] > -0.9) and require_all:
+                        or sign * normal[2] > -0.8) and require_all:
                     return False, contacts
         if not require_all and any(sum(contacts[(side, jaw)] for jaw in ("lower", "upper")) < min_contacts
                                    for side in ("right", "left")):
@@ -316,22 +314,9 @@ class PushController:
             print(error, flush=True)
             self.change("failed")
             return False
-        qpos_before = self.data.qpos.copy()
-        qvel_before = self.data.qvel.copy()
         for name, value in corrected.items():
-            qadr, dadr, _ = self.arm_pose[name]
-            self.arm_pose[name] = (qadr, dadr, value)
+            self.arm_pose[name] = value
             self.arms.set(name, value)
-            self.data.qpos[qadr], self.data.qvel[dadr] = value, 0
-        mujoco.mj_forward(self.model, self.data)
-        violation = self.handle_penetration()
-        if violation:
-            self.data.qpos[:] = qpos_before
-            self.data.qvel[:] = qvel_before
-            mujoco.mj_forward(self.model, self.data)
-            print(f"grasp correction would penetrate handle: {violation}", flush=True)
-            self.change("failed")
-            return False
         return True
 
     def plan_arm_pose(self, marker_pose, lateral_backoff=0.0):
@@ -346,17 +331,12 @@ class PushController:
             self.change("failed")
             return False
         for name, value in joints.items():
-            joint = obj_id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            qadr = self.model.jnt_qposadr[joint]
-            dadr = self.model.jnt_dofadr[joint]
-            self.arm_start[name] = float(self.data.qpos[qadr])
-            self.arm_pose[name] = (qadr, dadr, value)
+            self.arm_pose[name] = value
             self.arms.set(name, value)
         return True
 
     def tick(self):
         d = self.data
-        self.apply_prescribed_pose()
         if d.time - self.last_image >= 0.1 and self.state in ("find", "approach", "align"):
             self.last_image = d.time
             found = self.detector.detect(d)
@@ -371,7 +351,7 @@ class PushController:
         elif self.state == "approach":
             center, x_axis, _ = self.marker_pose
             bx, by, yaw = self.base.pose()
-            desired = center[:2] - 0.40 * x_axis[:2]
+            desired = center[:2] - APPROACH_STANDOFF * x_axis[:2]
             delta = desired - np.array([bx, by])
             heading = math.atan2(x_axis[1], x_axis[0])
             yaw_error = wrap(heading - yaw)
@@ -386,19 +366,16 @@ class PushController:
         elif self.state == "align":
             self.base.stop()
             if d.time - self.state_start > 0.6:
-                if self.plan_arm_pose(self.marker_pose, lateral_backoff=ARM_SETUP_LATERAL):
+                if self.plan_arm_pose(self.marker_pose, lateral_backoff=ARM_SETUP_BACKOFF):
                     self.arms.gripper("right", OPEN_GRIP)
                     self.arms.gripper("left", OPEN_GRIP)
                     self.change("arm_pregrasp")
         elif self.state == "arm_pregrasp":
             self.base.stop()
-            if d.time - self.state_start > 4:
+            if (self.arms.near(self.arm_names, tol=0.06)
+                    or d.time - self.state_start > ARM_SETTLE_S):
                 x_axis = self.marker_pose[1]
                 self.slide_target = np.array(self.base.pose()[:2]) + BASE_SLIDE_DISTANCE * x_axis[:2]
-                self.change("move_in")
-        elif self.state == "arm_pregrasp":
-            self.base.stop()
-            if d.time - self.state_start > 4:
                 self.change("move_in")
         elif self.state == "move_in":
             _, x_axis, _ = self.marker_pose
@@ -416,33 +393,34 @@ class PushController:
             else:
                 self.base.command(np.clip(0.35 * distance, -0.08, 0.08) if abs(yaw_error) < 0.2 else 0,
                                   np.clip(1.5 * yaw_error + 0.7 * lateral, -0.25, 0.25))
-        elif self.state == "close" and d.time - self.state_start > 2:
-            self.change("verify")
+        elif self.state == "close":
+            self.base.stop()
+            self.hold_grippers_on_contact()
+            touching, _ = self.clamp_status(min_contacts=1, xy_tolerance=0.05,
+                                            z_tolerance=0.04, require_all=False)
+            if (len(self.grip_latched) >= 4 or touching
+                    or d.time - self.state_start > CLOSE_SETTLE_S):
+                self.change("verify")
         elif self.state == "verify":
             clamped, contacts = self.clamp_status()
             if clamped:
                 if self.clamp_since is None:
                     self.clamp_since = d.time
                 elif d.time - self.clamp_since >= 0.5:
-                    # The connect constraints supplement the verified pads;
-                    # they do not stand in for the contact check.
-                    for eq in self.constraints.values():
-                        d.eq_active[eq] = 1
                     print(f"both handles clamped: {contacts}", flush=True)
                     self.change("push")
             else:
                 self.clamp_since = None
-                if d.time - self.state_start > 2:
+                if d.time - self.state_start > VERIFY_SETTLE_S:
                     print(f"no stable two-sided clamp: {contacts}", flush=True)
                     self.change("failed")
         elif self.state == "push":
-            # The placeholder gripper/contact model does not transmit push
-            # force reliably. A bounded virtual coupling transfers the base's
-            # displacement to the chair while its wheels remain dynamic.
+            # Pad-on-plate contact carries the squeeze. A light coupling only
+            # helps the chair's wheels start rolling; it is no longer the grasp.
             base_xy = np.array(self.base.pose()[:2])
             desired = self.push_chair_start + base_xy - self.push_base_start
             error_xy = desired - d.xpos[self.chair_body, :2]
-            d.xfrc_applied[self.chair_body, :2] = np.clip(400 * error_xy, -35, 35)
+            d.xfrc_applied[self.chair_body, :2] = np.clip(180 * error_xy, -18, 18)
             clamped, contacts = self.clamp_status(min_contacts=1, xy_tolerance=0.05,
                                                   z_tolerance=0.03, require_all=False)
             if not clamped:
@@ -469,7 +447,7 @@ class PushController:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--seconds", type=float, default=30)
+    parser.add_argument("--seconds", type=float, default=45)
     args = parser.parse_args()
     if sys.platform == "darwin" and not args.headless and os.environ.get("_CAREGIVER_MJPYTHON") != "1":
         launcher = shutil.which("mjpython")
@@ -481,13 +459,6 @@ def main():
 
     world = build()
     model = mujoco.MjModel.from_xml_path(world)
-    # The explicit pad boxes are the gripper collision surfaces. The imported
-    # visual hand/finger meshes have broad convex hulls that overlap the handle
-    # even at a valid clamp, so use the pads as their contact proxies.
-    for geom in range(model.ngeom):
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[geom]) or ""
-        if ("finger" in body_name or body_name in ("hand__hand", "l_hand__hand")) and model.geom_contype[geom] == 4:
-            model.geom_contype[geom] = 0
     data = mujoco.MjData(model)
     set_demo_pose(model, data)
     controller = PushController(model, data)

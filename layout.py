@@ -51,6 +51,10 @@ RF_CUTOFF = 4.0
 COL_WORLD = dict(contype="1", conaffinity="5")
 COL_BASE = dict(contype="1", conaffinity="1")
 COL_ARM = dict(contype="4", conaffinity="0")
+# Finger meshes collide with the wheelchair handles (bit 8/16), not with each
+# other or the rest of the robot. conaffinity must stay 0: the two finger
+# hulls overlap at rest, and 16&8 would make them explode on the first step.
+COL_FINGER = dict(contype="16", conaffinity="0")
 
 
 def is_north(room):

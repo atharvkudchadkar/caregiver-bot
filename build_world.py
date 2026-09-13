@@ -82,6 +82,9 @@ def make_robot_solid(base):
                   size="0.13 0.2 0.08", pos="0.01 0 0.17", **common)
     ET.SubElement(base, "geom", name="col_mast", type="capsule",
                   fromto="0.01 0 0.25 0.01 0 1.55", size="0.06", **common)
+    # Finger *meshes* stay COL_ARM (world only). Their convex hulls are far
+    # fatter than the real fingers and would tunnel the handle. The jaw pads
+    # added below are the clamp surfaces.
 
 def add_lidar(base, sensor):
         """Add the front rangefinder beams used by obstacle avoidance."""
@@ -246,6 +249,8 @@ def build(obstacle=False, config_path=None):
         hand = base.find(f".//body[@name='{hand_name}']")
         ET.SubElement(hand, "site", name=f"{side}_grasp", pos=grasp_pos,
                       size="0.008", rgba="1 0.4 0 1")
+    # Thin rubber pads on the inner jaw faces. These, not the finger meshes,
+    # are the rigid clamp surfaces (box-on-box against the flat handle).
     pads = (
         ("right", "lower", "left_finger__left_finger", "-0.0422 -0.0107 -0.0295",
          "-0.70157 -0.02082 0.71229 0.70952 0.07235 0.70096"),
@@ -256,13 +261,15 @@ def build(obstacle=False, config_path=None):
         ("left", "upper", "l_right_finger__right_finger", "-0.0249 0.0066 -0.0031",
          "-0.64231 0.18204 0.74451 0.76395 0.23045 0.60273"),
     )
+    pad_contact = dict(type="box", size="0.022 0.016 0.006",
+                       rgba="0.10 0.10 0.12 1", mass="0.001",
+                       friction="2.2 0.12 0.02", condim="3",
+                       solref="0.006 1", solimp="0.98 0.99 0.001",
+                       **layout.COL_FINGER)
     for side, jaw, body_name, pos, xyaxes in pads:
         finger = base.find(f".//body[@name='{body_name}']")
-        ET.SubElement(finger, "geom", name=f"{side}_{jaw}_pad", type="box",
-                      pos=pos, xyaxes=xyaxes, size="0.022 0.013 0.006",
-                      rgba="0.10 0.10 0.12 1", mass="0.001",
-                      friction="1.8 0.08 0.01", condim="3",
-                      contype="16", conaffinity="8")
+        ET.SubElement(finger, "geom", name=f"{side}_{jaw}_pad", pos=pos,
+                      xyaxes=xyaxes, **pad_contact)
         ET.SubElement(finger, "site", name=f"{side}_{jaw}_pad_site", pos=pos,
                       xyaxes=xyaxes, size="0.003", rgba="1 0.6 0 1")
     sensor = ET.Element("sensor")   # appended to root below
@@ -277,16 +284,18 @@ def build(obstacle=False, config_path=None):
     chair.set("pos", fmt(*sp["pos"]))
     chair.set("quat", yaw_quat(sp["yaw_deg"]))
     chair.set("childclass", "wheelchair")
-    # Let the arm meshes interact with the handle tubes, while the chair's
-    # broad seat/backrest stay out of the path of the prescribed reach.
+    # Jaw pads (bit 16) meet the flat handle plates (bit 8). The rest of the
+    # chair stays out of the arm path so a reach does not snag the backrest.
     handle_names = {f"wc_{side}_{part}" for side in ("left", "right")
-                    for part in ("push_handle", "handle_grip")}
+                    for part in ("push_handle", "handle_grip", "handle_tip")}
     for geom in chair.iter("geom"):
         if geom.get("name") in handle_names:
             geom.set("contype", "8")
             geom.set("conaffinity", "16")
-            geom.set("friction", "1.8 0.08 0.01")
+            geom.set("friction", "2.2 0.12 0.02")
             geom.set("condim", "3")
+            geom.set("solref", "0.006 1")
+            geom.set("solimp", "0.98 0.99 0.001")
         else:
             geom.set("conaffinity", "1")
     wb.append(chair)

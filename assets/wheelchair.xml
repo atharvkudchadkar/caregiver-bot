@@ -62,21 +62,29 @@
             contype="0" conaffinity="0" mass="0.001"/>
       <site name="rear_marker_center" pos="-0.231 0 0.84" size="0.005" rgba="1 1 1 1"/>
 
-      <!-- Uprights and rearward horizontal grips, as on a manual chair. -->
-      <geom name="left_push_handle" type="capsule"
-            fromto="-0.225 0.18 0.96 -0.42 0.18 0.96" size="0.018"
-            friction="1.2 0.02 0.002"/>
-      <geom name="right_push_handle" type="capsule"
-            fromto="-0.225 -0.18 0.96 -0.42 -0.18 0.96" size="0.018"
-            friction="1.2 0.02 0.002"/>
-      <geom name="left_handle_grip" type="capsule"
-            fromto="-0.31 0.18 0.96 -0.42 0.18 0.96" size="0.021"
-            rgba="0.08 0.08 0.08 1" friction="1.2 0.02 0.002"/>
-      <geom name="right_handle_grip" type="capsule"
-            fromto="-0.31 -0.18 0.96 -0.42 -0.18 0.96" size="0.021"
-            rgba="0.08 0.08 0.08 1" friction="1.2 0.02 0.002"/>
-      <site name="left_handle_grasp" pos="-0.35 0.18 0.96" size="0.008" rgba="1 0.4 0 1"/>
-      <site name="right_handle_grasp" pos="-0.35 -0.18 0.96" size="0.008" rgba="1 0.4 0 1"/>
+      <!-- Flat rearward handles: a square neck plus a thin clamp plate.
+           Jaws pinch the plate's top and bottom faces; capsules tunneled. -->
+      <geom name="left_push_handle" type="box"
+            pos="-0.270 0.18 0.96" size="0.045 0.012 0.012"
+            rgba="0.25 0.25 0.25 1" friction="2.0 0.1 0.01" condim="3"/>
+      <geom name="right_push_handle" type="box"
+            pos="-0.270 -0.18 0.96" size="0.045 0.012 0.012"
+            rgba="0.25 0.25 0.25 1" friction="2.0 0.1 0.01" condim="3"/>
+      <geom name="left_handle_grip" type="box"
+            pos="-0.355 0.18 0.96" size="0.040 0.022 0.009"
+            rgba="0.08 0.08 0.08 1" friction="2.0 0.1 0.01" condim="3"/>
+      <geom name="right_handle_grip" type="box"
+            pos="-0.355 -0.18 0.96" size="0.040 0.022 0.009"
+            rgba="0.08 0.08 0.08 1" friction="2.0 0.1 0.01" condim="3"/>
+      <!-- Short flat stubs at the free ends: the jaws swallow these and close. -->
+      <geom name="left_handle_tip" type="box"
+            pos="-0.412 0.18 0.96" size="0.022 0.028 0.013"
+            rgba="0.06 0.06 0.06 1" friction="2.2 0.12 0.02" condim="3"/>
+      <geom name="right_handle_tip" type="box"
+            pos="-0.412 -0.18 0.96" size="0.022 0.028 0.013"
+            rgba="0.06 0.06 0.06 1" friction="2.2 0.12 0.02" condim="3"/>
+      <site name="left_handle_grasp" pos="-0.412 0.18 0.96" size="0.008" rgba="1 0.4 0 1"/>
+      <site name="right_handle_grasp" pos="-0.412 -0.18 0.96" size="0.008" rgba="1 0.4 0 1"/>
 
       <!-- Rear frame supports -->
       <geom name="left_rear_frame" type="capsule"

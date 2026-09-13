@@ -172,6 +172,21 @@ class Arms:
     def gripper(self, side, value):
         self.set(f"gripper_{side}", value)
 
+    def hold_current(self):
+        """Match servo setpoints to the current joint angles so nothing snaps."""
+        for name, aid in self.act.items():
+            q = float(self.d.qpos[self.m.jnt_qposadr[int(self.m.actuator_trnid[aid, 0])]])
+            self.targets[name] = q
+            self.d.ctrl[aid] = q
+
+    def near(self, names, tol=0.05):
+        for name in names:
+            aid = self.act[name]
+            q = self.d.qpos[self.m.jnt_qposadr[int(self.m.actuator_trnid[aid, 0])]]
+            if abs(q - self.targets[name]) > tol:
+                return False
+        return True
+
     def step(self):
         """Ramp ctrl toward targets so a new command doesn't jerk the balancer."""
         dt = self.m.opt.timestep
