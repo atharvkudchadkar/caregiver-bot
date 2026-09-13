@@ -5,12 +5,18 @@
   python run_world.py --goto bathroom --headless --seconds 90
   python run_world.py --joint rj1=0.4 --joint rj0=-0.3 --joint gripper_right=0.8
   python run_world.py --real-time              watch the viewer at 1x wall-clock speed
+  python run_world.py --speed 4                run at a fixed 4x wall-clock speed
+  python run_world.py --speed-slider           drag a live slider (0.1x-20x, or uncapped)
+  python run_world.py --voice --voice-device 1 listen for spoken commands
+  python run_world.py --voice --voice-device 1 --voice-debug   tune mic detection live
 
 The viewer runs as fast as the machine can simulate/render by default (headless
 mode always did). This only changes how quickly wall-clock time passes on
 screen; the robot's commanded speed, torque limits and control gains are all
-defined in simulated seconds and are untouched. Pass --real-time to cap the
-viewer back to 1x if you want to watch it move at its true pace.
+defined in simulated seconds and are untouched regardless of the multiplier.
+--real-time caps the viewer to 1x, --speed N to a fixed multiplier, and
+--speed-slider opens a small window with a live slider (see speed_control.py)
+so you can drag the speed up or down, or check "uncapped", while it's running.
 
 The balance law is the teammate's (run_balance.py), rewritten in the robot's
 body frame so it works at any heading and adds differential torque for
@@ -25,6 +31,22 @@ localization memory, and unseen destinations require exploration.
 Arrow keys (viewer window must have focus):
   up/down     +/- 0.1 m/s forward speed      left/right   +/- 0.3 rad/s turn rate
   space       stop                            r            reset to spawn pose
+  g           line up on the wheelchair and clamp its handles (known pose, not vision)
+  x           release the clamp
+
+While G is lining up: arrows nudge the approach manually, Space resumes
+automatic alignment. Once clamped, the chair drives as one body with the
+robot - navigation (autonomous or teleop) drives both until X releases it.
+
+Voice commands (--voice), seven in total, spoken through the chosen
+microphone and transcribed offline (see voice_control.py):
+  "go to <room>"            navigate to a learned room, exploring if needed
+  "explore"                  autonomously explore visible free space
+  "come home" / "go home"    return to the startup pose
+  "stop"                      immediately stop and drop to manual control
+  "reset"                     reset to the spawn pose
+  "grab/attach the wheelchair"     line up and clamp the handles
+  "let go/detach the wheelchair"   release the clamp
 """
 import argparse
 import math
@@ -35,147 +57,14 @@ import mujoco.viewer
 import numpy as np
 
 from camera_rig import CameraRig, load_config
+from robot_base import Arms, BalanceBase, wrap
 from vision_navigation import VisionNavigator
+from voice_control import VoiceListener
+from push_wheelchair import PushController, ATTACH_STATES, LINEUP_STATES
 
 WORLD = "world.xml"
-GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82}
-
-
-def wrap(a):
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-
-class BalanceBase:
-    """Two-wheel balancer with a (v, w) command interface."""
-
-    V_MAX, W_MAX = 0.4, 0.8
-    TORQUE_MAX = 20.0
-    FALL_DEG = 20.0
-
-    def __init__(self, model, data):
-        self.m, self.d = model, data
-        self.base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "mobile_base")
-        self.motors = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
-                       for n in ("left_motor", "right_motor")]
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "base_free")
-        self.qadr = model.jnt_qposadr[jid]
-        self.dadr = model.jnt_dofadr[jid]
-        self._vel = np.zeros(6)
-        self.v_cmd = self.w_cmd = 0.0
-        self.fallen = False
-        self.reset_targets()
-
-    # -- commands -----------------------------------------------------------
-    def command(self, v, w):
-        self.v_cmd = float(np.clip(v, -self.V_MAX, self.V_MAX))
-        self.w_cmd = float(np.clip(w, -self.W_MAX, self.W_MAX))
-
-    def stop(self):
-        self.command(0.0, 0.0)
-
-    def reset_targets(self):
-        self.progress_target = None   # world-frame point the base should be under
-        self.yaw_target = None
-
-    # -- state --------------------------------------------------------------
-    def pose(self):
-        q = self.d.qpos[self.qadr:self.qadr + 7]
-        w, x, y, z = q[3:7]
-        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        return float(q[0]), float(q[1]), yaw
-
-    def pitch(self):
-        R = self.d.xmat[self.base_id].reshape(3, 3)
-        return math.atan2(-R[2, 0], R[2, 2])   # + = leaning forward (over +x_body)
-
-    # -- control ------------------------------------------------------------
-    def step(self):
-        """One physics step. Call at model.opt.timestep."""
-        m, d = self.m, self.d
-        mujoco.mj_step1(m, d)             # kinematics/sensors for the current state
-        pitch = self.pitch()
-        if abs(pitch) > math.radians(self.FALL_DEG) or not np.isfinite(d.qpos).all():
-            self.fallen = True
-        if self.fallen:
-            d.ctrl[self.motors] = 0.0
-            mujoco.mj_step2(m, d)
-            return
-
-        mujoco.mj_objectVelocity(m, d, mujoco.mjtObj.mjOBJ_BODY, self.base_id, self._vel, 1)
-        pitch_rate, yaw_rate, v_fwd = self._vel[1], self._vel[2], self._vel[3]
-        x, y, yaw = self.pose()
-        heading = np.array([math.cos(yaw), math.sin(yaw)])
-        pos = np.array([x, y])
-        dt = m.opt.timestep
-
-        # Forward-progress target: integrates v_cmd along the heading, lateral drift discarded.
-        if self.progress_target is None:
-            self.progress_target = pos.copy()
-        self.progress_target += self.v_cmd * heading * dt
-        e_fwd = float(np.clip(np.dot(self.progress_target - pos, heading), -0.3, 0.3))
-        self.progress_target = pos + heading * e_fwd
-
-        # Teammate's gains, body-frame version. Positive torque drives beneath a forward lean.
-        tau_bal = (100.0 * pitch + 20.0 * pitch_rate
-                   + 20.0 * (-e_fwd)
-                   + 15.0 * (v_fwd - self.v_cmd))
-
-        if self.yaw_target is None:
-            self.yaw_target = yaw
-        self.yaw_target = wrap(self.yaw_target + self.w_cmd * dt)
-        e_yaw = float(np.clip(wrap(self.yaw_target - yaw), -0.5, 0.5))
-        tau_turn = 4.0 * e_yaw + 1.0 * (self.w_cmd - yaw_rate)   # TODO tune on the real thing
-
-        d.ctrl[self.motors[0]] = np.clip(tau_bal - tau_turn, -self.TORQUE_MAX, self.TORQUE_MAX)
-        d.ctrl[self.motors[1]] = np.clip(tau_bal + tau_turn, -self.TORQUE_MAX, self.TORQUE_MAX)
-        mujoco.mj_step2(m, d)
-
-
-class Arms:
-    """Position targets for the arm, lift and gripper servos.
-
-    Joint names are the URDF's: rj0/lj0 (lift, metres), rj1..rj6 / lj1..lj6
-    (radians), plus 'gripper_right' / 'gripper_left' (0 open .. 1 closed),
-    which drive both finger servos together.
-    """
-
-    def __init__(self, model, data):
-        self.m, self.d = model, data
-        self.act = {}
-        for aid in range(model.nu):
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid)
-            if name.endswith("_target"):
-                self.act[name[:-len("_target")]] = aid
-        self.targets = {name: 0.0 for name in self.act}
-        self.ramp = {name: (0.15 if name.endswith("0") else 0.6) for name in self.act}  # units/s
-
-    def names(self):
-        return list(self.act) + ["gripper_right", "gripper_left"]
-
-    def set(self, name, value):
-        if name == "gripper_right":
-            self.set("right_left_gripper", value)
-            self.set("right_right_gripper", value)
-            return
-        if name == "gripper_left":
-            self.set("left_left_gripper", value)
-            self.set("left_right_gripper", value)
-            return
-        if name not in self.act:
-            raise KeyError(f"unknown joint {name!r}; one of {self.names()}")
-        lo, hi = self.m.actuator_ctrlrange[self.act[name]]
-        self.targets[name] = float(np.clip(value, lo, hi))
-
-    def gripper(self, side, value):
-        self.set(f"gripper_{side}", value)
-
-    def step(self):
-        """Ramp ctrl toward targets so a new command doesn't jerk the balancer."""
-        dt = self.m.opt.timestep
-        for name, aid in self.act.items():
-            delta = self.targets[name] - self.d.ctrl[aid]
-            step = self.ramp[name] * dt
-            self.d.ctrl[aid] += float(np.clip(delta, -step, step))
+GLFW_KEYS = {"up": 265, "down": 264, "left": 263, "right": 262, "space": 32, "r": 82,
+             "g": 71, "x": 88}
 
 
 def reset(model, data, base):
@@ -200,10 +89,26 @@ def main():
     ap.add_argument("--no-memory", action="store_true", help="run without loading or saving a map")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--seconds", type=float, default=60.0, help="headless run time")
-    ap.add_argument("--real-time", action="store_true",
-                    help="cap the viewer to wall-clock speed (default: run as fast as the "
-                         "machine can simulate/render; the robot's own commanded speed, "
-                         "torque limits and control gains are unaffected either way)")
+    speed = ap.add_mutually_exclusive_group()
+    speed.add_argument("--real-time", action="store_true", help="cap the viewer to 1x wall-clock speed")
+    speed.add_argument("--speed", type=float, metavar="X",
+                       help="fixed wall-clock speed multiplier, e.g. 4 for 4x (default: uncapped)")
+    speed.add_argument("--speed-slider", action="store_true",
+                       help="open a window with a live speed slider (0.1x-20x, or an "
+                            "'uncapped' checkbox) so you can change it while running")
+    ap.add_argument("--voice", action="store_true",
+                    help="listen for spoken commands: 'go to <room>', 'explore', "
+                         "'come home', 'stop', 'reset', 'grab the wheelchair', "
+                         "'let go of the wheelchair'")
+    ap.add_argument("--voice-device", help="microphone device index or name substring "
+                     "for --voice (default: system default mic)")
+    ap.add_argument("--voice-model", default="small",
+                    help="faster-whisper model size for --voice (default: small)")
+    ap.add_argument("--voice-threshold", type=float,
+                    help="manual microphone noise gate for --voice (default: auto-calibrated "
+                         "from 1s of room noise at startup)")
+    ap.add_argument("--voice-debug", action="store_true",
+                    help="print a live mic level meter for --voice, to help tune detection")
     ap.add_argument("--joint", action="append", default=[], metavar="NAME=VALUE",
                     help="arm/lift/gripper target, repeatable")
     args = ap.parse_args()
@@ -213,10 +118,16 @@ def main():
         ap.error(f"unknown room {room!r}; labels: {config['room_names']}")
     if args.goal and not np.isfinite(args.goal).all():
         ap.error("goal coordinates must be finite")
+    if args.speed is not None and args.speed <= 0:
+        ap.error("--speed must be a positive number")
     model = mujoco.MjModel.from_xml_path(args.world)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     base, arms = BalanceBase(model, data), Arms(model, data)
+    # Shares base/arms with navigation rather than owning its own, so the two
+    # never fight over the same actuators; starts idle ("drive", unattached)
+    # rather than the standalone demo's auto-attach-on-launch.
+    push = PushController(model, data, base=base, arms=arms, start_state="drive")
     for entry in args.joint:
         name, _, value = entry.partition("=")
         arms.set(name.strip(), float(value))
@@ -231,24 +142,83 @@ def main():
     state = None
     last_narration = last_save = -100.0
     print("RGB navigation: head + left hand + right hand; local wheel odometry; no preset routes")
+    print("Wheelchair: press G to line up and clamp the handles, X to release "
+          "(or say 'grab the wheelchair' / 'let go of the wheelchair' with --voice)")
+
+    voice_device = args.voice_device
+    if voice_device is not None:
+        try:
+            voice_device = int(voice_device)
+        except ValueError:
+            pass
+    voice = VoiceListener(config["room_names"], device=voice_device, model_size=args.voice_model,
+                          energy_threshold=args.voice_threshold,
+                          debug=args.voice_debug) if args.voice else None
+
+    def do_reset():
+        nonlocal nav, push, last_narration, last_save
+        nav.memory.save()
+        reset(model, data, base)
+        rig.reset()
+        nav = VisionNavigator(config, memory_path=memory_path)
+        # A physical reset snaps the chair back to its spawn pose too (part of
+        # mj_resetData above); the grasp/hitch state has to restart to match.
+        push = PushController(model, data, base=base, arms=arms, start_state="drive")
+        last_narration = last_save = -100.0
+
+    def handle_voice_command(cmd):
+        nonlocal autonomous, nav
+        print(f"t={data.time:.1f}s [voice] heard {cmd.text!r} -> {cmd.kind}"
+              + (f" {cmd.room}" if cmd.room else ""), flush=True)
+        if cmd.kind == "stop":
+            autonomous = False
+            base.stop()
+        elif cmd.kind == "reset":
+            do_reset()
+        elif cmd.kind == "explore":
+            autonomous = True
+            nav = VisionNavigator(config, memory=nav.memory)
+        elif cmd.kind == "home":
+            autonomous = True
+            nav = VisionNavigator(config, goal=[0.0, 0.0], memory=nav.memory)
+        elif cmd.kind == "goto":
+            autonomous = True
+            nav = VisionNavigator(config, room=cmd.room, memory=nav.memory)
+        elif cmd.kind == "attach":
+            push.attach_chair()
+        elif cmd.kind == "detach":
+            push.detach_chair()
 
     def control_tick():
         nonlocal state, last_narration, last_save
+        if voice is not None:
+            cmd = voice.poll()
+            if cmd:
+                handle_voice_command(cmd)
         pose, frames = rig.sample(data)
         if frames is not None:
             nav.observe(frames, pose)
             if not base.fallen:
-                if autonomous:
+                if push.state in ATTACH_STATES:
+                    push.decide()   # lining up / reaching / clamping owns the base+arms
+                elif autonomous:
                     base.command(*nav.command(pose, data.time))
                 else:
                     base.command(*nav.guard(pose, data.time, base.v_cmd, base.w_cmd))
             for event in nav.memory.drain_events():
                 print(f"t={data.time:.1f}s {event}", flush=True)
-            if nav.state != state or data.time-last_narration >= 5:
-                state = nav.state
+            shown = push.state if push.state in ATTACH_STATES else nav.state
+            if shown != state or data.time-last_narration >= 5:
+                state = shown
                 last_narration = data.time
-                description = nav.explain(base.v_cmd, base.w_cmd) if autonomous else "Manual control: learning the visible layout and checking commanded clearance."
-                print(f"t={data.time:.1f}s [{state}] {description} "
+                if push.state in ATTACH_STATES:
+                    description = f"Wheelchair: {push.state}."
+                elif autonomous:
+                    description = nav.explain(base.v_cmd, base.w_cmd)
+                else:
+                    description = "Manual control: learning the visible layout and checking commanded clearance."
+                towing = " Towing the wheelchair." if push.linked else ""
+                print(f"t={data.time:.1f}s [{state}] {description}{towing} "
                       f"Mapped {nav.map.seen.sum()*config['resolution']**2:.1f} square metres.", flush=True)
             if data.time-last_save >= 15:
                 if nav.memory.save():
@@ -269,9 +239,34 @@ def main():
             base.stop()
         arms.step()
         base.step()
+        # Keep the chair glued to the robot (no-op unless actually linked) and
+        # roll back any planar step that would clip a chair part through a
+        # wall. Chair-contact jostling can otherwise register as a fall;
+        # only forgive that while the wheelchair mechanism is actually in
+        # play; a real fall during ordinary navigation still needs 'r'.
+        push.apply_hitch()
+        push.block_wall_clip()
+        if (push.linked or push.state in ATTACH_STATES) and base.fallen:
+            base.fallen = False
+            base.reset_targets()
 
     def on_key(keycode):
         nonlocal autonomous, nav, last_narration, last_save
+        if keycode == GLFW_KEYS["g"]:
+            push.attach_chair()
+            return
+        if keycode == GLFW_KEYS["x"]:
+            push.detach_chair()
+            return
+        if push.state in LINEUP_STATES:
+            if keycode == GLFW_KEYS["space"]:
+                push.accept_lineup()
+                return
+            if keycode in (GLFW_KEYS[k] for k in ("up", "down", "left", "right")):
+                push.drive_lineup(keycode)
+            return
+        if push.state in ATTACH_STATES:
+            return   # mid-reach/clamp; arrows/space don't apply here
         if keycode in (GLFW_KEYS[k] for k in ("up", "down", "left", "right", "space", "r")):
             autonomous = False
         if keycode == GLFW_KEYS["up"]:
@@ -285,15 +280,14 @@ def main():
         elif keycode == GLFW_KEYS["space"]:
             base.stop()
         elif keycode == GLFW_KEYS["r"]:
-            nav.memory.save()
-            reset(model, data, base)
-            rig.reset()
-            nav = VisionNavigator(config, memory_path=memory_path)
-            last_narration = last_save = -100.0
+            do_reset()
         else:
             return
         print(f"cmd v={base.v_cmd:+.1f} m/s  w={base.w_cmd:+.1f} rad/s")
 
+    if voice is not None:
+        voice.start()
+    slider = None
     try:
         if args.headless:
             for _ in range(int(args.seconds / model.opt.timestep)):
@@ -306,6 +300,11 @@ def main():
                   f"navigation={nav.state}")
             return
         steps_per_frame = 10
+        if args.speed_slider:
+            from speed_control import SpeedSlider
+            slider = SpeedSlider(initial=1.0)
+            print("Speed slider window opened: drag it, or check 'Uncapped', while the sim runs.")
+        fixed_speed = 1.0 if args.real_time else args.speed  # None means uncapped
         with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as viewer:
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             viewer.cam.trackbodyid = base.base_id
@@ -319,8 +318,13 @@ def main():
                 if base.fallen and not announced:
                     print("fell over: press r to reset")
                     announced = True
-                if args.real_time:
-                    remaining = steps_per_frame * model.opt.timestep - (time.monotonic() - t0)
+                if slider is not None:
+                    slider.pump()
+                    multiplier = None if slider.closed else slider.multiplier
+                else:
+                    multiplier = fixed_speed
+                if multiplier is not None:
+                    remaining = steps_per_frame * model.opt.timestep / multiplier - (time.monotonic() - t0)
                     if remaining > 0:
                         time.sleep(remaining)
     except KeyboardInterrupt:
@@ -333,6 +337,10 @@ def main():
                       f"and {len(nav.memory.rooms)} rooms to {memory_path}.", flush=True)
         finally:
             rig.close()
+            if voice is not None:
+                voice.stop()
+            if slider is not None and not slider.closed:
+                slider.close()
             if args.camera_preview:
                 import cv2
                 cv2.destroyAllWindows()

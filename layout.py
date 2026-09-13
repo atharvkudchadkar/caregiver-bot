@@ -10,12 +10,19 @@ continuous and the "doorway" segments overlapped, so no room was reachable.
 WALL_HALF_T = 0.075 * 1.5   # 15 cm thick walls, scaled up 1.5x
 WALL_HALF_H = 0.6 * 1.5     # 1.2 m tall (scaled 1.5x): see into rooms from the overview camera
 DOOR_W = 1.2
-
-# Direct pathway between the bedroom and kitchen, in addition to the hallway.
-BRIDGE_Y = 2.0
-BRIDGE_W = DOOR_W
 HALL_X = (-6.0, 6.0)      # hallway runs east-west along y = 0
 HALL_Y = (-0.75, 0.75)
+
+# Direct pathways between a west room and an east room, in addition to the
+# main hallway - alternate routes the robot can learn and, once it knows
+# both, should prefer whichever is actually shorter (see VisionNavigator).
+# Each bridge gets its own pair of localization-only codes (see
+# bridge_marker_positions) flanking the doorway on the west room's side.
+BRIDGE_W = DOOR_W
+BRIDGES = {
+    "bedroom_kitchen":        dict(west="bedroom",  east="kitchen",     y=2.0,  marker_ids=(8, 9)),
+    "bathroom_living_room":   dict(west="bathroom", east="living_room", y=-1.8, marker_ids=(10, 11)),
+}
 
 # Rooms north of the hallway have y[0] == HALL_Y[1]; rooms south have y[1] == HALL_Y[0].
 # door_x is the centre of the doorway on the hallway wall.
@@ -26,11 +33,15 @@ ROOMS = {
     "living_room": dict(x=(1.0, 6.0),   y=(-5.25, -0.75), door_x=3.5,   color=(0.2, 0.8, 0.3)),
 }
 
-# Initial poses. Robot starts in the bedroom facing its door (south), the
-# wheelchair sits against the west wall out of the door lane.
+# Initial poses. Robot starts in the bedroom facing its door (south); the
+# wheelchair sits out of the door lane, facing south (rear toward the north
+# wall) rather than east (rear toward the west wall, only 0.9m clear - not
+# enough room for the robot to reach the standoff point behind it and grasp
+# the handles; facing south leaves 1.55m, and roughly faces the robot's own
+# spawn instead of requiring a loop around the chair).
 SPAWN = {
     "robot":      dict(pos=(-3.5, 2.6, 0.005), yaw_deg=-90.0),
-    "wheelchair": dict(pos=(-4.6, 2.2, -0.055), yaw_deg=0.0),
+    "wheelchair": dict(pos=(-4.6, 2.2, -0.055), yaw_deg=-90.0),
 }
 
 # Optional test obstacle (build_world.py --obstacle): a 0.5 m crate in the
@@ -43,6 +54,10 @@ OBSTACLE = dict(pos=(0.0, 0.3, 0.3), size=(0.25, 0.25, 0.3))
 COL_WORLD = dict(contype="1", conaffinity="5")
 COL_BASE = dict(contype="1", conaffinity="1")
 COL_ARM = dict(contype="4", conaffinity="0")
+# Finger meshes collide with the wheelchair handles (bit 8/16), not with each
+# other or the rest of the robot. conaffinity must stay 0: the two finger
+# hulls overlap at rest, and 16&8 would make them explode on the first step.
+COL_FINGER = dict(contype="16", conaffinity="0")
 
 
 def is_north(room):
@@ -81,6 +96,27 @@ def marker_positions(room):
     return [(r["door_x"] - dx, y), (r["door_x"] + dx, y)]
 
 
+def bridge_marker_positions(key, inset=0.35, wall_margin=0.1):
+    """Two wall-mounted positions flanking bridge `key`'s doorway on its west
+    room's side, on the solid wall segments to either side of the opening,
+    facing into that room so they're seen on approach.
+
+    Clamped to the west room's own y-range: if the doorway sits close to one
+    of that room's other walls (as bathroom's does, for the
+    bathroom_living_room bridge - its hallway-facing wall is only ~0.15m past
+    the doorway edge), a fixed inset would overshoot straight through that
+    wall and land the marker outside the room entirely (observed: floating
+    inside the main hallway instead of mounted on the bathroom wall)."""
+    b = BRIDGES[key]
+    room = ROOMS[b["west"]]
+    y0, y1 = room["y"]
+    x = room["x"][1]
+    gy0, gy1 = b["y"] - BRIDGE_W / 2, b["y"] + BRIDGE_W / 2
+    lo = max(gy0 - inset, y0 + wall_margin)
+    hi = min(gy1 + inset, y1 - wall_margin)
+    return [(x, lo), (x, hi)]
+
+
 # --- Furniture ---------------------------------------------------------
 # Simple primitive props (boxes/cylinders), kept well clear of the doorway,
 # the flanking markers above, and the robot/wheelchair spawns. All positions
@@ -94,7 +130,6 @@ FURN_COLOR = dict(
     # channel spread) from the near-neutral-gray floor colour classifier in
     # vision_navigation.py, so they never get mistaken for walkable floor.
     porcelain=(0.95, 0.92, 0.83, 1), linen=(0.92, 0.87, 0.75, 1),
-    terracotta=(0.72, 0.42, 0.3, 1), leaf=(0.22, 0.5, 0.24, 1),
 )
 
 
@@ -106,17 +141,13 @@ def _cyl(name, pos, size, color):
     return dict(name=name, type="cylinder", pos=tuple(pos), size=tuple(size), rgba=FURN_COLOR[color])
 
 
-def _sphere(name, pos, radius, color):
-    return dict(name=name, type="sphere", pos=tuple(pos), size=(radius,), rgba=FURN_COLOR[color])
-
-
 def furniture():
     """name -> list of primitive geom specs (pos/size are half-extents, metres)."""
     items = {}
 
     # Bedroom: a bed against the far (north) wall, east of the door and both
     # spawns, plus a nightstand at its head. Sized/placed to stay clear of the
-    # bedroom/kitchen bridge doorway (BRIDGE_Y +/- BRIDGE_W/2 on the east wall).
+    # bedroom/kitchen bridge doorway (bedroom_kitchen bridge, on the east wall).
     r = ROOMS["bedroom"]
     bx = r["x"][1] - 0.7                       # east side, clear of the door lane
     by = far_wall_y("bedroom") - WALL_HALF_T - 0.32 - 0.05
@@ -164,17 +195,6 @@ def furniture():
         _cyl("toilet_bowl", (tx, bowl_y, 0.19), (0.19, 0.19), "porcelain"),
         _box("toilet_seat", (tx, bowl_y, 0.4), (0.19, 0.22, 0.02), "porcelain"),
     ]
-
-    # A potted plant halfway along the bedroom<->kitchen bridge corridor,
-    # centred on the walkway but small enough to leave clearance on both
-    # sides (corridor half-width 0.6 m vs. plant radius 0.25 m).
-    plant_x = (ROOMS["bedroom"]["x"][1] + ROOMS["kitchen"]["x"][0]) / 2
-    items["bridge"] = [
-        _cyl("plant_pot", (plant_x, BRIDGE_Y, 0.15), (0.15, 0.15), "terracotta"),
-        _sphere("plant_foliage_1", (plant_x, BRIDGE_Y, 0.55), 0.22, "leaf"),
-        _sphere("plant_foliage_2", (plant_x - 0.08, BRIDGE_Y + 0.05, 0.68), 0.15, "leaf"),
-        _sphere("plant_foliage_3", (plant_x + 0.1, BRIDGE_Y - 0.06, 0.62), 0.16, "leaf"),
-    ]
     return items
 
 
@@ -193,24 +213,37 @@ def wall_segments():
         segs.append((f"{tag}_{len(doors)}", x, y, hx1, y))
     segs.append(("hall_west", hx0, hy0, hx0, hy1))
     segs.append(("hall_east", hx1, hy0, hx1, hy1))
-    gy0, gy1 = BRIDGE_Y - BRIDGE_W / 2, BRIDGE_Y + BRIDGE_W / 2
+    # Each bridge punches a doorway-width gap in its west room's east wall and
+    # its east room's west wall, keyed by room name so a room in two bridges
+    # (not currently the case, but the code doesn't assume otherwise) would
+    # just get two gaps.
+    gaps = {}   # room -> {"east": (gy0, gy1)} and/or {"west": (gy0, gy1)}
+    for bridge in BRIDGES.values():
+        gy0, gy1 = bridge["y"] - BRIDGE_W / 2, bridge["y"] + BRIDGE_W / 2
+        gaps.setdefault(bridge["west"], {})["east"] = (gy0, gy1)
+        gaps.setdefault(bridge["east"], {})["west"] = (gy0, gy1)
     for name, r in ROOMS.items():
         x0, x1 = r["x"]
         y0, y1 = r["y"]
-        if name == "bedroom":       # doorway to the bedroom/kitchen bridge
+        room_gaps = gaps.get(name, {})
+        if "east" in room_gaps:
+            gy0, gy1 = room_gaps["east"]
             segs.append((f"{name}_east_0", x1, y0, x1, gy0))
             segs.append((f"{name}_east_1", x1, gy1, x1, y1))
         else:
             segs.append((f"{name}_east", x1, y0, x1, y1))
-        if name == "kitchen":       # doorway to the bedroom/kitchen bridge
+        if "west" in room_gaps:
+            gy0, gy1 = room_gaps["west"]
             segs.append((f"{name}_west_0", x0, y0, x0, gy0))
             segs.append((f"{name}_west_1", x0, gy1, x0, y1))
         else:
             segs.append((f"{name}_west", x0, y0, x0, y1))
         far_y = y1 if is_north(name) else y0
         segs.append((f"{name}_far", x0, far_y, x1, far_y))
-    # Corridor walls joining the two doorways directly.
-    bx0, bx1 = ROOMS["bedroom"]["x"][1], ROOMS["kitchen"]["x"][0]
-    segs.append(("bridge_north", bx0, gy1, bx1, gy1))
-    segs.append(("bridge_south", bx0, gy0, bx1, gy0))
+    # Corridor walls joining each bridge's two doorways directly.
+    for key, bridge in BRIDGES.items():
+        gy0, gy1 = bridge["y"] - BRIDGE_W / 2, bridge["y"] + BRIDGE_W / 2
+        bx0, bx1 = ROOMS[bridge["west"]]["x"][1], ROOMS[bridge["east"]]["x"][0]
+        segs.append((f"{key}_north", bx0, gy1, bx1, gy1))
+        segs.append((f"{key}_south", bx0, gy0, bx1, gy0))
     return segs

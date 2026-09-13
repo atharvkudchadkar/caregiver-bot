@@ -91,6 +91,10 @@ class ObservedMap:
         self.seen = np.zeros_like(self.evidence, bool)
         self.visits = np.zeros_like(self.evidence)
         self.traveled = np.zeros_like(self.evidence, bool)
+        # Wall-clock expiry per cell for `block_temporarily` - never written into
+        # `evidence`/saved to disk, so a transient block can't corrupt the
+        # persisted map or permanently rule out a real shortcut.
+        self.blocked_until = np.zeros_like(self.evidence)
         self._previous_position = None
         self.targets = {}
         self._traversable = None
@@ -168,73 +172,127 @@ class ObservedMap:
                     heapq.heappush(queue, (candidate, v))
         return []
 
-    def traversable(self):
-        if self._traversable is not None:
+    def traversable(self, now=None):
+        if self._traversable is None:
+            occupied = ((self.evidence >= 0) | ~self.seen).astype(np.uint8)
+            radius = int(math.ceil(self.radius / self.resolution))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
+            inflated = cv2.dilate(occupied, kernel).astype(bool)
+            self._traversable = self.seen & (self.evidence < 0) & ~inflated
+        if now is None:
             return self._traversable
-        occupied = ((self.evidence >= 0) | ~self.seen).astype(np.uint8)
-        radius = int(math.ceil(self.radius / self.resolution))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
-        inflated = cv2.dilate(occupied, kernel).astype(bool)
-        self._traversable = self.seen & (self.evidence < 0) & ~inflated
-        return self._traversable
+        return self._traversable & ~(self.blocked_until > now)
 
-    def route(self, start_xy, goal_xy=None):
-        """Dijkstra over observed free cells; otherwise choose a reachable frontier."""
+    def block_temporarily(self, xy, now, radius=1.5, duration=45.0):
+        """Treat a neighborhood as impassable until `now + duration`.
+
+        For when a route through here keeps failing its live safety check on
+        every replan - e.g. floor-vision noise at a grazing viewing angle down
+        a long straight corridor can flip an already-verified-free cell to
+        blocked on a single bad frame, so the planned route flickers between
+        accepted and rejected forever instead of settling either way. Rather
+        than retry the exact same spot indefinitely, force routing to treat it
+        as blocked for a while so it commits to a different, already-known
+        route (e.g. the main hallway) instead. Not evidence, so it can't
+        corrupt the persisted map, and it expires so the shortcut stays
+        available to retry later.
+        """
+        cx, cy = self.cells(xy)
+        r = int(math.ceil(radius / self.resolution))
+        y0, y1 = max(0, cy-r), min(self.size, cy+r+1)
+        x0, x1 = max(0, cx-r), min(self.size, cx+r+1)
+        region = self.blocked_until[y0:y1, x0:x1]
+        np.maximum(region, now + duration, out=region)
+
+    def route(self, start_xy, goal_xy=None, now=None):
+        """Dijkstra over observed free cells; otherwise choose a reachable frontier.
+
+        The frontier is tried twice: first excluding any free cell close to an
+        observed wall (avoids picking pointless wall-hugging viewpoints in open
+        rooms), then - only if that finds nothing - without that exclusion. In
+        a narrow corridor (a doorway width or so), every traversable cell can
+        be "close to a wall" simultaneously on both sides, which would
+        otherwise collapse the frontier to nothing map-wide and leave the
+        robot with no next move even though most of the map is still unseen.
+        """
         start = tuple(self.cells(start_xy))
-        free = self.traversable()
-        if not self.inside(start) or not free[start[1], start[0]]:
+        free = self.traversable(now)
+        if not self.inside(start):
             return []
+        if not free[start[1], start[0]]:
+            # The robot's own cell can read as briefly non-traversable close to
+            # an inflated wall boundary (sensor noise, or simply standing near
+            # the edge of a doorway-width corridor) without it actually being
+            # blocked. Snap to the nearest traversable cell instead of failing
+            # outright, so a transient blip here doesn't strand the robot with
+            # no route at all.
+            ys, xs = np.nonzero(free)
+            if len(xs) == 0:
+                return []
+            nearest = np.argmin((xs-start[0])**2 + (ys-start[1])**2)
+            if (xs[nearest]-start[0])**2 + (ys[nearest]-start[1])**2 > (3*int(math.ceil(self.radius/self.resolution)))**2:
+                return []  # nothing traversable nearby; a real dead end
+            start = (int(xs[nearest]), int(ys[nearest]))
         goal = tuple(self.cells(goal_xy)) if goal_xy is not None else None
         frontier_width = 2 * (int(math.ceil(self.radius / self.resolution)) + 2) + 1
         # A wall bordering unknown space is not an exploration frontier. Start
         # from actual free/unknown boundaries, excluding occupied silhouettes,
         # then choose a reachable viewpoint set back by the base clearance.
         unknown_adjacent = cv2.dilate((~self.seen).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        boundary_base = self.seen & (self.evidence < 0) & unknown_adjacent
         wall_adjacent = cv2.dilate((self.evidence > 0).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-        boundary = self.seen & (self.evidence < 0) & unknown_adjacent & ~wall_adjacent
-        frontier = free & (cv2.dilate(boundary.astype(np.uint8), np.ones((frontier_width, frontier_width), np.uint8)) > 0)
-        cost, previous = {start: 0.0}, {}
-        queue = [(0.0, start)]
-        best, best_score = None, -math.inf
-        approach, approach_score = None, math.inf
-        start_goal_distance = np.linalg.norm(np.asarray(start_xy)-goal_xy) if goal_xy is not None else 0
-        while queue:
-            distance, u = heapq.heappop(queue)
-            if distance != cost[u]:
-                continue
-            if goal is not None and u == goal:
-                best = u
-                break
-            x, y = u
-            if goal_xy is not None:
-                remaining = np.linalg.norm(self.xy(u)-goal_xy)
-                if remaining < start_goal_distance-.3 and distance > .2:
-                    score = remaining + .05*distance
-                    if score < approach_score:
-                        approach, approach_score = u, score
-            if frontier[y, x] and distance > 0.5:
-                # Prefer nearby unexplored views; avoid repeatedly selecting
-                # already visited viewpoints. A known goal biases exploration.
-                score = -distance - 0.5 * self.visits[y, x]
+
+        def frontier_for(avoid_walls):
+            boundary = boundary_base & ~wall_adjacent if avoid_walls else boundary_base
+            return free & (cv2.dilate(boundary.astype(np.uint8),
+                                      np.ones((frontier_width, frontier_width), np.uint8)) > 0)
+
+        for avoid_walls in (True, False):
+            frontier = frontier_for(avoid_walls)
+            cost, previous = {start: 0.0}, {}
+            queue = [(0.0, start)]
+            best, best_score = None, -math.inf
+            approach, approach_score = None, math.inf
+            start_goal_distance = np.linalg.norm(np.asarray(start_xy)-goal_xy) if goal_xy is not None else 0
+            while queue:
+                distance, u = heapq.heappop(queue)
+                if distance != cost[u]:
+                    continue
+                if goal is not None and u == goal:
+                    best = u
+                    break
+                x, y = u
                 if goal_xy is not None:
-                    score -= 2 * np.linalg.norm(self.xy(u) - goal_xy)
-                if score > best_score:
-                    best, best_score = u, score
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-                v = (x+dx, y+dy)
-                if not self.inside(v) or not free[v[1], v[0]]:
-                    continue
-                if dx and dy and (not free[y, x+dx] or not free[y+dy, x]):
-                    continue
-                candidate = distance + self.resolution * math.hypot(dx, dy)
-                if candidate < cost.get(v, math.inf):
-                    cost[v], previous[v] = candidate, u
-                    heapq.heappush(queue, (candidate, v))
-        # If a remembered goal is temporarily disconnected, first get close
-        # enough to re-observe the gap from a safe reachable viewpoint. Stopping
-        # several metres away cannot refresh a stale doorway in camera range.
-        if goal is not None and best != goal and approach is not None:
-            best = approach
+                    remaining = np.linalg.norm(self.xy(u)-goal_xy)
+                    if remaining < start_goal_distance-.3 and distance > .2:
+                        score = remaining + .05*distance
+                        if score < approach_score:
+                            approach, approach_score = u, score
+                if frontier[y, x] and distance > 0.5:
+                    # Prefer nearby unexplored views; avoid repeatedly selecting
+                    # already visited viewpoints. A known goal biases exploration.
+                    score = -distance - 0.5 * self.visits[y, x]
+                    if goal_xy is not None:
+                        score -= 2 * np.linalg.norm(self.xy(u) - goal_xy)
+                    if score > best_score:
+                        best, best_score = u, score
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                    v = (x+dx, y+dy)
+                    if not self.inside(v) or not free[v[1], v[0]]:
+                        continue
+                    if dx and dy and (not free[y, x+dx] or not free[y+dy, x]):
+                        continue
+                    candidate = distance + self.resolution * math.hypot(dx, dy)
+                    if candidate < cost.get(v, math.inf):
+                        cost[v], previous[v] = candidate, u
+                        heapq.heappush(queue, (candidate, v))
+            # If a remembered goal is temporarily disconnected, first get close
+            # enough to re-observe the gap from a safe reachable viewpoint. Stopping
+            # several metres away cannot refresh a stale doorway in camera range.
+            if goal is not None and best != goal and approach is not None:
+                best = approach
+            if best is not None:
+                break
         if best is None:
             return []
         path = [best]
@@ -242,22 +300,40 @@ class ObservedMap:
             path.append(previous[path[-1]])
         return [self.xy(cell) for cell in reversed(path)]
 
-    def safe_segment(self, start, end):
-        free = self.traversable()
+    def safe_segment(self, start, end, now=None):
+        free = self.traversable(now)
         n = max(2, int(np.linalg.norm(np.asarray(end)-start) / self.resolution * 2) + 1)
         cells = self.cells(np.linspace(start, end, n))
         if not ((cells >= 0) & (cells < self.size)).all():
             return False
-        return bool(free[cells[:, 1], cells[:, 0]].all())
+        # Skip the very first sample - the robot's own current cell. In a tight
+        # passage (doorway width or so) it can briefly read as non-traversable
+        # from inflation/perception noise even though the robot is already
+        # safely there; requiring it to also pass would veto every future
+        # target and strand the robot in a REPLANNING loop with no way out.
+        return bool(free[cells[1:, 1], cells[1:, 0]].all())
 
 
 class VisionNavigator:
-    def __init__(self, config, room=None, goal=None, memory_path=None):
+    def __init__(self, config, room=None, goal=None, memory_path=None, memory=None):
+        """`memory`, if given, is an already-loaded NavigationMemory to keep
+        using (its map and localization state carry over) instead of loading
+        `memory_path` fresh. Switching to a new room/goal target mid-session
+        (a voice command, say) should reuse it: loading fresh would discard
+        that the robot already knows exactly where it is and force it to
+        re-locate a known landmark by turning in place, which fails outright
+        - and gets permanently stuck - if none happens to be in view right
+        then. Only an actual physical reset (spawn pose, 'r' key) should
+        start localization over from scratch."""
         self.config = config
         self.room, self.goal = room, None if goal is None else np.asarray(goal, float)
         self.vision = FloorVision(config)
-        self.map = ObservedMap(config)
-        self.memory = NavigationMemory(self.map, memory_path)
+        if memory is not None:
+            self.map = memory.grid
+            self.memory = memory
+        else:
+            self.map = ObservedMap(config)
+            self.memory = NavigationMemory(self.map, memory_path)
         self.local_goal = None if goal is None else np.asarray(goal, float)
         self.current_pose = np.zeros(3)
         self.localization_turn = 0.0
@@ -276,6 +352,8 @@ class VisionNavigator:
         self.arrival_turn = None
         self.arrival_yaw = None
         self.memory_hint = None
+        self.backup_attempts = 0
+        self.stall_since = None
 
     def observe(self, frames, pose):
         # Reject missing/stale cameras rather than treating unavailable pixels as clear.
@@ -330,6 +408,15 @@ class VisionNavigator:
         if now - self.progress_time > 45.0:
             self.state = "BLOCKED"
             return 0.0, 0.0
+        if now - self.progress_time > 20.0:
+            # No physical progress in 20s despite repeated (re)planning - a
+            # narrow passage can leave the robot stuck rejecting every
+            # candidate next step, or with no reachable frontier at all, from
+            # this exact spot and heading. Back up and turn to change vantage
+            # point before the 45s mark gives up for good; a few seconds of
+            # different geometry in view is often enough to unstick it.
+            self.state = "BACKING_UP"
+            return -0.12, 0.3
         tolerance = self.config["room_stop_distance"] if self.room else 0.3
         if self.goal is not None and np.linalg.norm(self.goal - pose[:2]) < tolerance:
             if self.room in self.memory.rooms:
@@ -358,7 +445,17 @@ class VisionNavigator:
                 self.explore_target = None
             planning_goal = self.goal if self.goal is not None else self.explore_target
             self.memory_hint = None
-            if self.goal is not None and self.memory.rooms.get(self.room, {}).get("visited"):
+            # route() already finds the shortest currently-known path through
+            # everywhere observed as free - if the apartment has more than one
+            # way to the goal (e.g. a direct corridor as well as the original
+            # hallway route), this picks whichever is actually shorter once
+            # both are known, rather than always retracing a specific
+            # previously-driven path. traveled_route is only a fallback for a
+            # remembered goal that's temporarily disconnected from what's
+            # currently observed and needs to be re-approached to refresh it.
+            self.path = self.map.route(pose[:2], planning_goal, now)
+            if (self.goal is not None and not self.path
+                    and self.memory.rooms.get(self.room, {}).get("visited")):
                 history = self.map.traveled_route(pose[:2], self.goal)
                 if history:
                     self.memory_hint = history[-1]
@@ -366,27 +463,55 @@ class VisionNavigator:
                         if np.linalg.norm(point-pose[:2]) >= .8:
                             self.memory_hint = point
                             break
-                    planning_goal = self.memory_hint
-            self.path = self.map.route(pose[:2], planning_goal)
+                    self.path = self.map.route(pose[:2], self.memory_hint, now)
             if self.goal is None and self.path:
                 self.explore_target = self.path[-1]
             self.last_plan = now
         if not self.path:
-            # Observe a full turn before declaring that no safe continuation exists.
-            self.state = "SCANNING" if self.scan_angle < 2*math.pi else "BLOCKED"
-            return (0.0, 0.4) if self.state == "SCANNING" else (0.0, 0.0)
+            # Observe a full turn before concluding nothing reachable is in
+            # view. If that comes up empty, try a few rounds of backing up
+            # and rescanning - a different vantage point a bit further back
+            # can reveal a frontier that was occluded or too close to a wall
+            # to register from here - before finally giving up.
+            if self.scan_angle < 2*math.pi:
+                self.state = "SCANNING"
+                return 0.0, 0.4
+            if self.backup_attempts < 3:
+                self.backup_attempts += 1
+                self.scan_angle = 0.0
+                self.state = "BACKING_UP"
+                return -0.12, 0.3
+            self.state = "BLOCKED"
+            return 0.0, 0.0
         self.scan_angle = 0.0
+        self.backup_attempts = 0
         # Use a short checked lookahead; never cut corners through inflated obstacles.
         target = None
         for point in self.path[1:]:
             if np.linalg.norm(point-pose[:2]) > 0.45:
                 break
-            if self.map.safe_segment(pose[:2], point):
+            if self.map.safe_segment(pose[:2], point, now):
                 target = point
         if target is None:
             self.path = []
+            # A route that keeps getting planned but never clears its own live
+            # safety check (e.g. floor-vision noise at a grazing angle down a
+            # long straight corridor flipping an already-verified-free cell to
+            # blocked on a single bad frame) will otherwise flicker between
+            # REPLANNING and SCANNING forever, retrying the exact same
+            # bottleneck every 0.5s replan without ever trying a different,
+            # already-known way round (e.g. the main hallway). If we haven't
+            # taken a real step in a while, block the spot we're stuck at for
+            # a while so the next plan is forced to go a different way.
+            if self.stall_since is None:
+                self.stall_since = now
+            elif now - self.stall_since > 6.0:
+                self.map.block_temporarily(pose[:2], now)
+                self.explore_target = None
+                self.stall_since = None
             self.state = "REPLANNING"
             return 0.0, 0.0
+        self.stall_since = None
         delta = target - pose[:2]
         err = (math.atan2(delta[1], delta[0]) - pose[2] + math.pi) % (2*math.pi) - math.pi
         if self.goal is None:
@@ -407,7 +532,7 @@ class VisionNavigator:
         pose = self.memory.pose(pose)
         distance = math.copysign(0.35 + abs(v)*0.5, v)
         end = pose[:2] + distance * np.array([math.cos(pose[2]), math.sin(pose[2])])
-        return (v if v == 0 or self.map.safe_segment(pose[:2], end) else 0.0), w
+        return (v if v == 0 or self.map.safe_segment(pose[:2], end, now) else 0.0), w
 
     def explain(self, v=0.0, w=0.0):
         """Concise observable intent for terminal narration, including wait reasons."""
@@ -419,6 +544,7 @@ class VisionNavigator:
             "CAMERA_LOST": "I am stopped because the camera observations are missing, stale, or unusable.",
             "SCANNING": "I am turning to inspect unobserved space and look for readable room signs.",
             "BLOCKED": "I am stopped: I cannot establish a safe route or have made no progress.",
+            "BACKING_UP": "I have made no progress for a while. I am backing up and turning to try a different vantage point.",
             "REPLANNING": "New observations changed the safe path. I am stopped while I replan.",
             "ARRIVED": f"I reached {room} using the learned map.",
             "ARRIVAL_SCAN": f"I reached the room-side destination. I am scanning inside {room} to remember landmarks for a future restart.",
