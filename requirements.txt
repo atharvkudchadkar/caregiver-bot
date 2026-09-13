@@ -1,5 +1,5 @@
 -r mujoco/requirements.txt
 scipy>=1.10
-opencv-python>=4.10,<6
+opencv-contrib-python>=4.10,<6
 sounddevice>=0.4.6
 faster-whisper>=1.0

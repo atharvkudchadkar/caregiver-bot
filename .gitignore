@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.png
+!assets/wheelchair_aruco_4x4_50_id0.png
 assets/markers/
 memory/
 verification/
