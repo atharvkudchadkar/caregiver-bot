@@ -36,27 +36,39 @@ WebXR needs a secure context, which includes loopback origins. This connection
 does not use Quest Link. See [ADB documentation](https://developer.android.com/tools/adb)
 and the [WebXR specification](https://www.w3.org/TR/webxr/).
 
+If entering VR immediately returns to the page, restart `quest_teleop.py`, reload
+the page in Quest Browser, and try again. The page now prints each WebXR startup
+stage and the exact browser error in the Python terminal. A successful startup
+prints `Immersive session, render layer, and local tracking are ready.` If the
+session ends without a JavaScript error, keep Quest Browser in the foreground,
+confirm the headset is awake, and update Quest Browser/headset software.
+
 ## Controls
 
 | Input | Robot action |
 | --- | --- |
 | Left thumbstick up/down | Drive forward/backward, up to 0.25 m/s |
-| Right thumbstick left/right | Turn left/right, up to 0.7 rad/s |
+| Turn your head left/right | Swivel the robot to the same relative yaw angle |
 | Controller position | Move the matching hand relative to the robot's head |
 | Controller rotation | Rotate the matching gripper relative to its calibrated orientation |
-| Rear grip/squeeze | Close that gripper; release to open |
-| Either thumbstick click | Recalibrate gripper orientation references |
+| Either rear grip/squeeze press within 2 m of chair | Align to its heading and attach both hands to the handles |
+| Rear grip/squeeze press while attached | Release the wheelchair and resume free arm tracking |
+| Either thumbstick click | Recalibrate head steering and gripper orientation references |
 | Exit VR / Stop and exit VR | Stop driving and hold the arms |
 
 The mapping follows the [WebXR `xr-standard` layout](https://www.w3.org/TR/webxr-gamepads-module-1/).
 Arm reach is scaled by 0.7 for the current smaller robot, bounded by joint limits,
 and applied through the existing arm servos. `--arm-scale` can tune the mapping.
-An unreachable target is approximated within joint limits; it does not teleport
-the hand. The robot keeps balancing while joystick commands are zero.
+An unreachable free-arm target is approximated within joint limits. The VR-only
+auto-attach action aligns the robot at the chair's rear using the chair's actual
+position and orientation, solves both arms onto the two handle sites, and locks
+that relative pose for towing. The attached arms remain fixed on the handles.
+Every arm link collides with every wheelchair component in this VR process.
+These runtime collision changes do not alter `world.xml` or `run_world.py`.
 
 The single **head_cam** image is shown to both eyes as a flat video view. It is
-monoscopic, with no synthetic stereo or 360-degree view. Turning your head does
-not rotate a simulated neck joint. This is the head-camera behavior supplied by
+monoscopic, with no synthetic stereo or 360-degree view. Head yaw controls the
+mobile base's target heading; pitch and roll do not steer. This is based on
 the source branch. Hand cameras and autonomous navigation are not part of this
 VR process; room collision geometry remains active.
 

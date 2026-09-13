@@ -20,6 +20,32 @@ python run_world.py --explore --camera-preview
 python run_world.py --goto bathroom --camera-preview
 ```
 
+## Meta Quest VR mode
+
+VR runs as a separate simulation and does not start or communicate with
+`run_world.py`. Enable Developer Mode for the Quest, connect it with a USB data
+cable, accept USB debugging in the headset, and verify that `adb devices` lists
+it as `device`. Then run:
+
+```powershell
+adb reverse tcp:8765 tcp:8765
+python build_world.py
+python quest_teleop.py
+```
+
+Open `http://127.0.0.1:8765` in Quest Browser, confirm the live head-camera
+preview, and select **Enter VR and connect**. The left thumbstick drives forward
+and backward. Turning your head swivels the robot through the same relative yaw
+angle; the right thumbstick does not steer. Moving each controller moves the
+matching arm. Press either rear grip within 2 metres of the wheelchair to align
+with its orientation and attach both hands to its handles; press again to
+release it. Every arm link collides with the complete wheelchair in VR mode.
+
+If VR immediately closes, restart `quest_teleop.py`, reload the page, and watch
+the terminal for lines beginning with `Quest Browser:`. A successful connection
+ends with `Immersive session, render layer, and local tracking are ready.` See
+[VR_TELEOP.md](VR_TELEOP.md) for full setup, controls, and troubleshooting.
+
 The default memory file is `memory/robot_map.npz`. It is loaded automatically,
 autosaved every 15 simulated seconds, and saved on normal exit or Ctrl+C. Use
 `--memory memory/another_building.npz` for a different environment. A missing

@@ -8,16 +8,16 @@
   button { font: inherit; padding: .8rem 1.2rem; border: 0; border-radius: .5rem; background: #64d6b5; color: #10201d; }
   #status { margin: 1rem 0; color: #aee3d5; }
   #preview { display: block; width: 100%; max-width: 640px; aspect-ratio: 16/9; background: #0b1118; border-radius: .5rem; }
-  canvas { width: 1px; height: 1px; }
+  canvas { width: 1px; height: 1px; position: fixed; left: -2px; top: -2px; }
 </style>
 <h1>Bracket Bot VR control</h1>
 <p>Stand comfortably with both controllers visible, then enter VR. Each controller sets its gripper's position relative to your headset, so lifting a controller lifts that gripper. The robot's head camera appears in the headset and the desktop window shows the MuJoCo scene.</p>
-<p>Move the left thumbstick forward/back to drive. Move the right thumbstick sideways to turn. Hold either rear grip/squeeze button to close that hand's gripper; release to open it. Click either thumbstick to reset the gripper orientation reference.</p>
+<p>Move the left thumbstick forward/back to drive. Turn your head left or right and the robot swivels through the same angle. Press either rear grip/squeeze button within 2 metres of the wheelchair to align with its orientation and attach both hands to its handles; press again to release. Click either thumbstick to reset the head and gripper orientation references.</p>
 <button id="start">Enter VR and connect</button>
 <button id="stop" disabled>Stop and exit VR</button>
-<p id="status">Checking WebXR…</p>
+<p id="status">Checking WebXR...</p>
 <img id="preview" alt="Live robot head camera">
-<canvas id="surface"></canvas>
+<canvas id="surface" width="1024" height="1024"></canvas>
 <script>
 const status = document.getElementById('status');
 const start = document.getElementById('start');
@@ -38,7 +38,24 @@ let videoProgram = null;
 let videoBuffer = null;
 let videoScale = null;
 let videoReceivedAt = -Infinity;
+let sessionStartedAt = 0;
+let requestedEnd = false;
+let setupFailure = '';
+let frameErrorShown = false;
 const stop = document.getElementById('stop');
+
+function report(message) {
+  console.log(message);
+  fetch('/event', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message}), keepalive: true,
+  }).catch(() => {});
+}
+
+function errorText(error) {
+  if (!error) return 'Unknown browser error';
+  return (error.name ? error.name + ': ' : '') + (error.message || String(error));
+}
 
 function shader(type, source) {
   const item = gl.createShader(type);
@@ -79,7 +96,7 @@ function requestVideo(timestamp) {
   if (videoPending || timestamp - lastVideo < 70) return;
   lastVideo = timestamp;
   videoPending = true;
-  fetch('/frame.jpg', {cache: 'no-store', signal: AbortSignal.timeout(1000)})
+  fetch('/frame.jpg', {cache: 'no-store'})
     .then(response => { if (!response.ok) throw new Error('camera unavailable'); return response.blob(); })
     .then(blob => createImageBitmap(blob))
     .then(bitmap => {
@@ -131,7 +148,6 @@ function send(hands, active = true, recenter = false, head = null) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({hands, active, recenter: resetOrientation, head}),
-    signal: AbortSignal.timeout(300),
     keepalive: !active,
   }).then(response => {
     if (!response.ok) throw new Error('Input rejected (' + response.status + ')');
@@ -145,8 +161,19 @@ function send(hands, active = true, recenter = false, head = null) {
 function onFrame(timestamp, frame) {
   if (!session) return;
   session.requestAnimationFrame(onFrame);
-  requestVideo(timestamp);
-  drawVideo(frame);
+  try {
+    requestVideo(timestamp);
+    drawVideo(frame);
+  } catch (error) {
+    send({}, false);
+    if (!frameErrorShown) {
+      frameErrorShown = true;
+      const message = 'VR frame error: ' + errorText(error);
+      status.textContent = message;
+      report(message);
+    }
+    return;
+  }
   if (timestamp - lastSent < 30) return;
   lastSent = timestamp;
   const viewerPose = frame.getViewerPose(referenceSpace);
@@ -186,25 +213,36 @@ function onFrame(timestamp, frame) {
 start.addEventListener('click', async () => {
   if (session) return;
   start.disabled = true;
+  requestedEnd = false;
+  setupFailure = '';
+  frameErrorShown = false;
   try {
+    report('Start selected; checking immersive-vr support.');
     if (!navigator.xr || !await navigator.xr.isSessionSupported('immersive-vr')) {
       throw new Error('Immersive WebXR is unavailable in this browser. Open this page in Quest Browser.');
     }
-    gl = canvas.getContext('webgl', {xrCompatible: true});
+    gl = canvas.getContext('webgl', {xrCompatible: true, alpha: false, antialias: false});
     if (!gl) throw new Error('WebGL is unavailable');
     await gl.makeXRCompatible();
     setupVideo();
-    session = await navigator.xr.requestSession('immersive-vr', {optionalFeatures: ['local-floor']});
-    session.updateRenderState({baseLayer: new XRWebGLLayer(session, gl)});
-    try { referenceSpace = await session.requestReferenceSpace('local-floor'); }
-    catch { referenceSpace = await session.requestReferenceSpace('local'); }
+    report('WebGL ready; requesting immersive-vr session.');
+    session = await navigator.xr.requestSession('immersive-vr');
+    sessionStartedAt = performance.now();
+    const layer = new XRWebGLLayer(session, gl, {alpha: false, antialias: false});
+    session.updateRenderState({baseLayer: layer});
+    referenceSpace = await session.requestReferenceSpace('local');
     session.addEventListener('end', () => {
+      const elapsed = Math.round(performance.now() - sessionStartedAt);
       session = null;
       send({}, false);
       start.disabled = false;
       stop.disabled = true;
       if (nextBitmap) { nextBitmap.close(); nextBitmap = null; }
-      status.textContent = 'VR ended; robot motion stopped.';
+      const message = setupFailure || (requestedEnd
+        ? 'VR ended by user; robot motion stopped.'
+        : `VR session ended unexpectedly after ${elapsed} ms. Keep Quest Browser open and check the Python terminal.`);
+      status.textContent = message;
+      report(message);
     });
     session.addEventListener('visibilitychange', () => {
       if (session.visibilityState !== 'visible') send({}, false);
@@ -213,21 +251,37 @@ start.addEventListener('click', async () => {
     videoReceivedAt = -Infinity;
     stop.disabled = false;
     status.textContent = 'Connected. The robot head camera is streaming to the headset.';
+    report('Immersive session, render layer, and local tracking are ready.');
     session.requestAnimationFrame(onFrame);
   } catch (error) {
-    if (session) { await session.end().catch(() => {}); session = null; }
+    setupFailure = 'VR startup failed: ' + errorText(error);
+    report(setupFailure);
+    const failedSession = session;
+    if (failedSession) await failedSession.end().catch(() => {});
+    session = null;
     start.disabled = false;
     stop.disabled = true;
     send({}, false);
-    status.textContent = error.message;
+    status.textContent = setupFailure;
   }
 });
 
 stop.addEventListener('click', () => {
+  requestedEnd = true;
   send({}, false);
   if (session) session.end();
 });
 window.addEventListener('pagehide', () => send({}, false));
+window.addEventListener('error', event => {
+  const message = 'Page error: ' + errorText(event.error || event.message);
+  status.textContent = message;
+  report(message);
+});
+window.addEventListener('unhandledrejection', event => {
+  const message = 'Page promise error: ' + errorText(event.reason);
+  status.textContent = message;
+  report(message);
+});
 
 if (!navigator.xr) status.textContent = 'WebXR not found. Use Meta Quest Browser on the headset.';
 else navigator.xr.isSessionSupported('immersive-vr').then(ok => {

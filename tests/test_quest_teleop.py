@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import socket
 from pathlib import Path
 import subprocess
@@ -16,9 +17,11 @@ from urllib.error import HTTPError, URLError
 import cv2
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from quest_teleop import (CameraFrames, QuestInput, QuestTeleop,
                           XR_TO_ROBOT, make_handler, TIMEOUT_S)
+from robot_base import wrap
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -77,15 +80,15 @@ class QuestTests(unittest.TestCase):
         m, d, receiver, teleop = self.simulation()
         p = self.home_packet(teleop)
         p['hands']['left']['stick'] = [0, -1]
-        p['hands']['right']['stick'] = [-1, 0]
         p['hands']['left']['squeeze'] = 1
         receiver.update(p)
         teleop.tick()
         self.assertAlmostEqual(d.time, m.opt.timestep)
         self.assertAlmostEqual(teleop.base.v_cmd, .25)
-        self.assertAlmostEqual(teleop.base.w_cmd, .7)
+        self.assertAlmostEqual(teleop.base.w_cmd, 0)
+        self.assertTrue(teleop.push.linked)
         self.assertEqual(teleop.arms.targets['left_left_gripper'], 0)
-        self.assertEqual(teleop.arms.targets['right_left_gripper'], 1)
+        self.assertEqual(teleop.arms.targets['right_left_gripper'], 0)
         receiver.received -= TIMEOUT_S+1
         for _ in range(12):
             teleop.tick()
@@ -108,12 +111,15 @@ class QuestTests(unittest.TestCase):
         self.assertLess(abs(teleop.arms.targets['lj2']), .05)
         self.assertEqual(teleop.base.v_cmd, 0)
 
-    def test_joysticks_physically_drive_and_turn_without_falling(self):
+    def test_head_yaw_physically_drives_equivalent_turn_without_falling(self):
         m, d, receiver, teleop = self.simulation()
         p = self.home_packet(teleop)
         start = np.array(teleop.base.pose())
         p['hands']['left']['stick'] = [0, -.6]
-        p['hands']['right']['stick'] = [-.5, 0]
+        receiver.update(p)
+        teleop.tick()  # establish neutral head and base headings
+        turn = .5
+        p['head']['orientation'] = Rotation.from_euler('y', turn).as_quat().tolist()
         for step in range(int(3/m.opt.timestep)):
             if step % 10 == 0:
                 receiver.update(p)
@@ -121,8 +127,63 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(teleop.base.fallen)
         end = np.array(teleop.base.pose())
         self.assertGreater(np.linalg.norm(end[:2]-start[:2]), .2)
-        self.assertGreater(abs(end[2]-start[2]), .4)
+        self.assertAlmostEqual(wrap(end[2]-start[2]), turn, delta=.08)
         self.assertTrue(np.isfinite(d.qpos).all())
+
+    def test_vr_arms_collide_with_every_chair_part(self):
+        m, _, _, teleop = self.simulation()
+        arm_geoms = [gid for gid in range(m.ngeom)
+                     if int(m.geom_bodyid[gid]) in teleop.arm_bodies]
+        chair_geoms = [gid for gid in range(m.ngeom) if m.geom(gid).name.startswith('wc_')]
+        self.assertTrue(arm_geoms)
+        self.assertTrue(chair_geoms)
+        for arm in arm_geoms:
+            for chair in chair_geoms:
+                self.assertTrue((m.geom_contype[arm] & m.geom_conaffinity[chair]) or
+                                (m.geom_contype[chair] & m.geom_conaffinity[arm]),
+                                (m.geom(arm).name, m.geom(chair).name))
+
+    def test_grip_press_auto_attaches_at_chair_orientation_and_toggles_release(self):
+        m, d, receiver, teleop = self.simulation()
+        chair_yaw = .65
+        a = teleop.push.chair_qadr
+        d.qpos[a:a+2] = [-4.15, 2.45]
+        d.qpos[a+3:a+7] = [math.cos(chair_yaw/2), 0, 0, math.sin(chair_yaw/2)]
+        mujoco.mj_forward(m, d)
+        p = self.home_packet(teleop)
+        p['hands']['right']['squeeze'] = 1
+        receiver.update(p)
+        teleop.tick()
+        self.assertTrue(teleop.push.linked)
+        self.assertAlmostEqual(wrap(teleop.base.pose()[2]-chair_yaw), 0, delta=.01)
+        for side in ('left', 'right'):
+            self.assertLess(np.linalg.norm(d.site_xpos[teleop.follower.sites[side]] -
+                                           d.site_xpos[teleop.push.handle_site[side]]), .03)
+        hitch = np.array(teleop.push.hitch[:3])
+        p['hands']['right']['squeeze'] = 0
+        p['hands']['left']['stick'] = [0, -.5]
+        p['head']['orientation'] = Rotation.from_euler('y', .2).as_quat().tolist()
+        for step in range(750):
+            if step % 10 == 0:
+                receiver.update(p)
+            teleop.tick()
+            self.assertFalse(teleop.base.fallen)
+        np.testing.assert_allclose(teleop.push.chair_local_pose(), hitch, atol=1e-6)
+        self.assertAlmostEqual(wrap(teleop.base.pose()[2]-chair_yaw), .2, delta=.08)
+        p['hands']['right']['squeeze'] = 1
+        receiver.update(p)
+        for _ in range(12): teleop.tick()
+        self.assertFalse(teleop.push.linked)
+
+    def test_grip_press_outside_two_metres_does_not_attach(self):
+        m, d, receiver, teleop = self.simulation()
+        a = teleop.push.chair_qadr
+        d.qpos[a:a+2] = [0, 0]
+        mujoco.mj_forward(m, d)
+        p = self.home_packet(teleop)
+        p['hands']['left']['squeeze'] = 1
+        receiver.update(p); teleop.tick()
+        self.assertFalse(teleop.push.linked)
 
     def test_both_arm_targets_follow_upward_motion_and_joint_limits(self):
         m, d, receiver, teleop = self.simulation()
@@ -167,6 +228,10 @@ class QuestTests(unittest.TestCase):
             req = Request(url+'/input', data=json.dumps(packet()).encode(),
                           headers={'Content-Type': 'application/json'})
             with urlopen(req) as response:
+                self.assertEqual(response.status, 204)
+            event = Request(url+'/event', data=json.dumps({'message': 'session ready'}).encode(),
+                            headers={'Content-Type': 'application/json'})
+            with urlopen(event) as response:
                 self.assertEqual(response.status, 204)
             with self.assertRaises(HTTPError) as error:
                 urlopen(Request(url+'/input', data=b'{"hands":{"left":2},"active":false}'))

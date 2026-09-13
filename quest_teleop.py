@@ -23,8 +23,10 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from push_wheelchair import stiffen_grasp_servos
-from robot_base import Arms, BalanceBase
+from push_wheelchair import (APPROACH_STANDOFF, BASE_SLIDE_DISTANCE,
+                             CLOSED_GRIP, PushController, handle_targets,
+                             solve_grasp_ik, stiffen_grasp_servos)
+from robot_base import Arms, BalanceBase, wrap
 
 
 HERE = Path(__file__).resolve().parent
@@ -34,6 +36,9 @@ CONTROL_PERIOD_S = 0.02
 MAX_HEAD_RELATIVE_REACH_M = 0.8
 MAX_ABOVE_HEAD_M = 0.05  # physical arm reach above the head camera
 VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS = 640, 360, 15
+AUTO_ATTACH_RANGE_M = 2.0
+HEAD_TURN_GAIN = 2.0
+VR_ARM_COLLISION_BIT = 64
 # WebXR: x right, y up, -z forward. Robot: x forward, y left, z up.
 XR_TO_ROBOT = np.array([[0., 0., -1.], [-1., 0., 0.], [0., 1., 0.]])
 
@@ -41,6 +46,36 @@ XR_TO_ROBOT = np.array([[0., 0., -1.], [-1., 0., 0.], [0., 1., 0.]])
 def deadzone(value, threshold=0.15):
     value = float(np.clip(value, -1, 1))
     return 0.0 if abs(value) < threshold else math.copysign((abs(value) - threshold) / (1 - threshold), value)
+
+
+def headset_yaw(head):
+    """Horizontal WebXR viewing angle, positive to the user's left."""
+    rotation = Rotation.from_quat(head["orientation"]).as_matrix()
+    forward = rotation @ np.array([0., 0., -1.])
+    return math.atan2(-forward[0], -forward[2])
+
+
+def enable_vr_arm_chair_collisions(model):
+    """In this in-memory VR model, make every arm link collide with every chair part."""
+    shoulder_roots = {
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        for name in ("shoulder__shoulder", "l_shoulder__shoulder")
+    }
+    arm_bodies = set()
+    for bid in range(model.nbody):
+        current = bid
+        while current:
+            if current in shoulder_roots:
+                arm_bodies.add(bid)
+                break
+            current = int(model.body_parentid[current])
+    for gid in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
+        if int(model.geom_bodyid[gid]) in arm_bodies:
+            model.geom_contype[gid] |= VR_ARM_COLLISION_BIT
+        if name.startswith("wc_"):
+            model.geom_conaffinity[gid] |= VR_ARM_COLLISION_BIT
+    return arm_bodies
 
 
 class QuestInput:
@@ -143,7 +178,25 @@ def make_handler(receiver, frames):
             self.wfile.write(body)
 
         def do_POST(self):
-            if self.path != "/input":
+            path = self.path.split("?", 1)[0]
+            if path == "/event":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 2048:
+                        raise ValueError("event too large or empty")
+                    event = json.loads(self.rfile.read(length))
+                    message = str(event.get("message", ""))[:500].replace("\r", " ").replace("\n", " ")
+                    if not message:
+                        raise ValueError("event message is required")
+                    print(f"Quest Browser: {message}", flush=True)
+                except (ValueError, TypeError, OverflowError) as error:
+                    self.send_error(400, str(error))
+                    return
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path != "/input":
                 self.send_error(404)
                 return
             try:
@@ -307,9 +360,78 @@ class QuestTeleop:
         stiffen_grasp_servos(model, self.arms)
         self.arms.hold_current()
         self.follower = ArmFollower(model, data, self.arms, arm_scale)
+        self.arm_bodies = enable_vr_arm_chair_collisions(model)
+        self.push = PushController(model, data, base=self.base, arms=self.arms,
+                                   start_state="drive")
+        self.push.manual = True
         self.last_control = -1.0
         self.was_active = False
         self.tracked_hands = set()
+        self.squeeze_down = {"left": False, "right": False}
+        self.head_reference = None
+        self.robot_yaw_reference = None
+
+    def reset_head_steering(self, head):
+        self.head_reference = headset_yaw(head)
+        self.robot_yaw_reference = self.base.pose()[2]
+        self.base.reset_targets()
+
+    def chair_distance(self):
+        robot = np.asarray(self.base.pose()[:2])
+        chair = np.asarray(self.push.chair_pose()[:2])
+        return float(np.linalg.norm(chair - robot))
+
+    def auto_attach(self):
+        """Snap to the orientation-aware rear grasp pose and lock both handles."""
+        distance = self.chair_distance()
+        if distance > AUTO_ATTACH_RANGE_M:
+            print(f"Wheelchair is {distance:.2f} m away; move within {AUTO_ATTACH_RANGE_M:.0f} m to attach.",
+                  flush=True)
+            return False
+        marker = self.push.marker_from_chair()
+        center, x_axis, _ = marker
+        chair_yaw = math.atan2(x_axis[1], x_axis[0])
+        target_xy = center[:2] - (APPROACH_STANDOFF - BASE_SLIDE_DISTANCE) * x_axis[:2]
+        adr, dadr = self.base.qadr, self.base.dadr
+        self.data.qpos[adr:adr + 2] = target_xy
+        half = chair_yaw / 2
+        self.data.qpos[adr + 3:adr + 7] = (math.cos(half), 0., 0., math.sin(half))
+        self.data.qvel[dadr:dadr + 6] = 0
+        self.base.stop()
+        self.base.fallen = False
+        self.base.reset_targets()
+        mujoco.mj_forward(self.model, self.data)
+        marker = self.push.marker_from_chair()
+        joints = solve_grasp_ik(self.model, self.data, handle_targets(marker), marker[1])
+        for name, value in joints.items():
+            aid = self.arms.act[name]
+            jid = int(self.model.actuator_trnid[aid, 0])
+            self.data.qpos[self.model.jnt_qposadr[jid]] = value
+            self.arms.targets[name] = value
+            self.data.ctrl[aid] = value
+        for side in ("left", "right"):
+            self.arms.gripper(side, CLOSED_GRIP[side])
+            for name in (f"{side}_left_gripper", f"{side}_right_gripper"):
+                aid = self.arms.act[name]
+                jid = int(self.model.actuator_trnid[aid, 0])
+                self.data.qpos[self.model.jnt_qposadr[jid]] = CLOSED_GRIP[side]
+                self.data.ctrl[aid] = CLOSED_GRIP[side]
+        mujoco.mj_forward(self.model, self.data)
+        self.arms.hold_current()
+        self.push.grasp_locked = True
+        self.push.link_chair()
+        self.follower.recenter()
+        print(f"VR auto-attached both handles from {distance:.2f} m; chair heading "
+              f"{math.degrees(chair_yaw):+.0f} degrees.", flush=True)
+        return True
+
+    def toggle_attachment(self):
+        if self.push.linked:
+            self.push.release_grasp()
+            self.follower.recenter()
+            print("VR released the wheelchair; arm tracking resumed.", flush=True)
+            return False
+        return self.auto_attach()
 
     def hold_missing_hands(self, hands):
         for side in self.tracked_hands - set(hands):
@@ -332,27 +454,51 @@ class QuestTeleop:
             if active:
                 if packet["recenter"] or not self.was_active:
                     self.follower.recenter()
+                    self.reset_head_steering(packet["head"])
                 hands = packet["hands"]
                 self.hold_missing_hands(hands)
-                for side, hand in hands.items():
-                    self.follower.follow(side, hand, packet["head"])
-                    self.arms.gripper(side, 0.0 if hand["squeeze"] >= 0.5 else 1.0)
+                pressed = False
+                for side in ("left", "right"):
+                    down = side in hands and hands[side]["squeeze"] >= 0.5
+                    pressed |= down and not self.squeeze_down[side]
+                    self.squeeze_down[side] = down
+                if pressed:
+                    self.toggle_attachment()
+                    # Attachment can align the base to a new chair heading;
+                    # make that heading the new zero instead of steering back.
+                    self.reset_head_steering(packet["head"])
+                if not self.push.linked:
+                    for side, hand in hands.items():
+                        self.follower.follow(side, hand, packet["head"])
+                        self.arms.gripper(side, 0.0 if hand["squeeze"] >= 0.5 else 1.0)
+                else:
+                    for side in ("left", "right"):
+                        self.arms.gripper(side, CLOSED_GRIP[side])
                 left = hands.get("left")
-                right = hands.get("right")
                 v = -0.25 * deadzone(left["stick"][1]) if left else 0.0
-                w = -0.7 * deadzone(right["stick"][0]) if right else 0.0
+                if self.head_reference is None:
+                    self.reset_head_steering(packet["head"])
+                desired_yaw = wrap(self.robot_yaw_reference
+                                   + wrap(headset_yaw(packet["head"]) - self.head_reference))
+                yaw_error = wrap(desired_yaw - self.base.pose()[2])
+                w = float(np.clip(HEAD_TURN_GAIN * yaw_error,
+                                  -self.base.W_MAX, self.base.W_MAX))
                 self.base.command(v, w)
             else:
                 self.base.stop()
                 if self.was_active:
                     self.follower.recenter()
                 self.tracked_hands.clear()
+                self.squeeze_down = {"left": False, "right": False}
+                self.head_reference = self.robot_yaw_reference = None
             if active != self.was_active:
                 print("VR connected: controller tracking active." if active else
                       "VR paused: stopping the base and holding the arms.", flush=True)
             self.was_active = active
         self.arms.step()
         self.base.step()
+        self.push.apply_hitch()
+        self.push.block_wall_clip()
         mujoco.mj_forward(self.model, self.data)
 
 
@@ -391,7 +537,7 @@ def main():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Quest input: http://127.0.0.1:{args.port} (run adb reverse tcp:{args.port} tcp:{args.port})", flush=True)
-    print("Independent VR simulation. Left stick: drive; right stick: turn; grips: close hands.", flush=True)
+    print("Independent VR simulation. Left stick: drive; head yaw: turn; grip press: attach/release chair.", flush=True)
     print("Head-camera video is monoscopic. Ctrl+C or closing the viewer exits this runner.", flush=True)
     renderer = None
     last_capture = -1.0
