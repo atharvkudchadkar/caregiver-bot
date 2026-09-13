@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quest robot teleoperation</title>
+<style>
+  body { font: 18px system-ui, sans-serif; color: #eee; background: #16202a; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+  button { font: inherit; padding: .8rem 1.2rem; border: 0; border-radius: .5rem; background: #64d6b5; color: #10201d; }
+  #status { margin: 1rem 0; color: #aee3d5; }
+  #preview { display: block; width: 100%; max-width: 640px; aspect-ratio: 16/9; background: #0b1118; border-radius: .5rem; }
+  canvas { width: 1px; height: 1px; }
+</style>
+<h1>Robot arm control</h1>
+<p>Stand comfortably with both controllers visible, then enter VR. Each controller sets its gripper's position relative to your headset, so lifting a controller lifts that gripper. The robot's head camera appears in the headset and the desktop window shows the MuJoCo scene.</p>
+<p>Move the left thumbstick forward/back to drive. Move the right thumbstick sideways to turn. Hold either rear grip/squeeze button to close that hand's gripper; release to open it. Click either thumbstick to reset the gripper orientation reference.</p>
+<button id="start">Enter VR and connect</button>
+<p id="status">Checking WebXR…</p>
+<img id="preview" alt="Live robot head camera">
+<canvas id="surface"></canvas>
+<script>
+const status = document.getElementById('status');
+const start = document.getElementById('start');
+const canvas = document.getElementById('surface');
+const preview = document.getElementById('preview');
+let session = null;
+let referenceSpace = null;
+let gl = null;
+let pending = false;
+let lastSent = 0;
+let recenterDown = false;
+let videoPending = false;
+let lastVideo = 0;
+let nextBitmap = null;
+let videoTexture = null;
+let videoProgram = null;
+let videoBuffer = null;
+let videoScale = null;
+
+function shader(type, source) {
+  const item = gl.createShader(type);
+  gl.shaderSource(item, source);
+  gl.compileShader(item);
+  if (!gl.getShaderParameter(item, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(item));
+  return item;
+}
+
+function setupVideo() {
+  videoProgram = gl.createProgram();
+  gl.attachShader(videoProgram, shader(gl.VERTEX_SHADER,
+    'attribute vec2 position; uniform vec2 scale; varying vec2 uv; void main(){uv=vec2(position.x*0.5+0.5, 0.5-position.y*0.5); gl_Position=vec4(position*scale,0.0,1.0);}'));
+  gl.attachShader(videoProgram, shader(gl.FRAGMENT_SHADER,
+    'precision mediump float; varying vec2 uv; uniform sampler2D picture; void main(){gl_FragColor=texture2D(picture,uv);}'));
+  gl.linkProgram(videoProgram);
+  if (!gl.getProgramParameter(videoProgram, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(videoProgram));
+  gl.useProgram(videoProgram);
+  videoScale = gl.getUniformLocation(videoProgram, 'scale');
+  gl.uniform1i(gl.getUniformLocation(videoProgram, 'picture'), 0);
+  videoBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, videoBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const position = gl.getAttribLocation(videoProgram, 'position');
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+  videoTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+    new Uint8Array([12, 24, 32, 255]));
+}
+
+function requestVideo(timestamp) {
+  if (videoPending || timestamp - lastVideo < 70) return;
+  lastVideo = timestamp;
+  videoPending = true;
+  fetch('/frame.jpg', {cache: 'no-store'})
+    .then(response => { if (!response.ok) throw new Error('camera unavailable'); return response.blob(); })
+    .then(blob => createImageBitmap(blob))
+    .then(bitmap => { if (nextBitmap) nextBitmap.close(); nextBitmap = bitmap; })
+    .catch(() => {})
+    .finally(() => { videoPending = false; });
+}
+
+function drawVideo(frame) {
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0.07, 0.11, 0.15, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(videoProgram);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+  if (nextBitmap) {
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, nextBitmap);
+    nextBitmap.close();
+    nextBitmap = null;
+  }
+  const pose = frame.getViewerPose(referenceSpace);
+  if (!pose) return;
+  for (const view of pose.views) {
+    const viewport = layer.getViewport(view);
+    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    const aspect = viewport.width / viewport.height;
+    const imageAspect = 640 / 360;
+    gl.uniform2f(videoScale, Math.min(1, imageAspect / aspect), Math.min(1, aspect / imageAspect));
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+}
+
+setInterval(() => {
+  if (!session) preview.src = '/frame.jpg?t=' + Date.now();
+}, 500);
+
+function send(hands, active = true, recenter = false, head = null) {
+  if (pending) return;
+  pending = true;
+  fetch('/input', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hands, active, recenter, head}),
+  }).catch(error => { status.textContent = 'Connection lost: ' + error.message; })
+    .finally(() => { pending = false; });
+}
+
+function onFrame(timestamp, frame) {
+  if (!session) return;
+  session.requestAnimationFrame(onFrame);
+  requestVideo(timestamp);
+  drawVideo(frame);
+  if (timestamp - lastSent < 30) return;
+  lastSent = timestamp;
+  const viewerPose = frame.getViewerPose(referenceSpace);
+  if (!viewerPose) return;
+  const hp = viewerPose.transform.position;
+  const hq = viewerPose.transform.orientation;
+  const head = {position: [hp.x, hp.y, hp.z], orientation: [hq.x, hq.y, hq.z, hq.w]};
+  const hands = {};
+  let recenter = false;
+  let anyClick = false;
+  for (const input of session.inputSources) {
+    if (input.handedness !== 'left' && input.handedness !== 'right') continue;
+    if (!input.gripSpace || !input.gamepad || input.gamepad.mapping !== 'xr-standard') continue;
+    const pose = frame.getPose(input.gripSpace, referenceSpace);
+    if (!pose) continue;
+    const p = pose.transform.position;
+    const q = pose.transform.orientation;
+    const pad = input.gamepad;
+    const click = Boolean(pad.buttons[3] && pad.buttons[3].pressed);
+    anyClick ||= click;
+    hands[input.handedness] = {
+      position: [p.x, p.y, p.z],
+      orientation: [q.x, q.y, q.z, q.w],
+      stick: [pad.axes[2] || 0, pad.axes[3] || 0],
+      squeeze: pad.buttons[1] ? pad.buttons[1].value : 0,
+    };
+  }
+  if (anyClick && !recenterDown) recenter = true;
+  recenterDown = anyClick;
+  send(hands, true, recenter, head);
+}
+
+start.addEventListener('click', async () => {
+  try {
+    if (!navigator.xr || !await navigator.xr.isSessionSupported('immersive-vr')) {
+      throw new Error('Immersive WebXR is unavailable in this browser. Open this page in Quest Browser.');
+    }
+    gl = canvas.getContext('webgl', {xrCompatible: true});
+    if (!gl) throw new Error('WebGL is unavailable');
+    await gl.makeXRCompatible();
+    setupVideo();
+    session = await navigator.xr.requestSession('immersive-vr');
+    session.updateRenderState({baseLayer: new XRWebGLLayer(session, gl)});
+    try { referenceSpace = await session.requestReferenceSpace('local-floor'); }
+    catch { referenceSpace = await session.requestReferenceSpace('local'); }
+    session.addEventListener('end', () => {
+      session = null;
+      send({}, false);
+      status.textContent = 'VR ended; robot motion stopped.';
+    });
+    status.textContent = 'Connected. The robot head camera is streaming to the headset.';
+    session.requestAnimationFrame(onFrame);
+  } catch (error) {
+    status.textContent = error.message;
+  }
+});
+
+if (!navigator.xr) status.textContent = 'WebXR not found. Use Meta Quest Browser on the headset.';
+else navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+  status.textContent = ok ? 'Ready to connect.' : 'Immersive VR unavailable in this browser.';
+});
+</script>
+</html>

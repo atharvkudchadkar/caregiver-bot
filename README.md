@@ -31,6 +31,42 @@ python run_world.py --joint rj1=0.4 --joint lj6=-0.3 --joint gripper_right=0.8
 python build_world.py --obstacle                          crate in the hallway
 ```
 
+## Meta Quest 2 controller teleoperation
+
+`quest_teleop.py` uses the Quest Browser's WebXR controller tracking and streams
+the robot's head-camera view to both eyes as a flat, monoscopic video screen.
+The MuJoCo scene also remains visible on the Mac. Meta Quest Link is Windows-only,
+so the headset connects to the local
+Python server through Android Debug Bridge (ADB) USB port forwarding instead.
+
+1. Enable developer mode on the Quest 2, connect it by USB, and authorize USB
+   debugging in the headset. Install Android platform tools (`adb`) on the Mac.
+2. In a terminal, run `adb devices` to confirm the headset is authorized, then
+   run `adb reverse tcp:8765 tcp:8765`.
+3. In this project, run `python3 quest_teleop.py` (on macOS it relaunches under
+   `mjpython` for the desktop viewer).
+4. In **Quest Browser on the headset**, open `http://127.0.0.1:8765` and choose
+   **Enter VR and connect**. The page previews the live head camera before
+   entering VR. Hold both controllers where you want the robot's grippers.
+   Clicking either thumbstick resets the gripper orientation reference.
+
+Each controller sets the matching gripper's position relative to your headset:
+raising your hand raises the gripper, including above the robot's head when
+the arm can reach it. The arm rail starts at its upper position; the arm joints
+solve for the gripper target. Controller rotation changes gripper orientation
+relative to its initial pose. Targets are limited to the robot's physical reach.
+The **left thumbstick** drives forward/backward, and the
+**right thumbstick** turns. Hold a controller's **rear grip/squeeze button** to
+close that hand's gripper; release it to open. If packets stop for 350 ms, the
+robot base stops and its arm/gripper targets stay where they were. The simulator
+does not need the Quest Link desktop app.
+
+This connection uses the WebXR `xr-standard` gamepad mapping: the squeeze is
+button 1 and the thumbstick is axes 2/3. Quest Browser requires a secure
+context for WebXR; the headset's own `127.0.0.1` address is treated as local
+through `adb reverse`. See [Meta's headset setup](https://developers.meta.com/horizon/documentation/unity/unity-env-device-setup/)
+and the [WebXR input mapping](https://www.w3.org/TR/webxr-gamepads-module-1/).
+
 The terminal narrates what the robot is doing: what it is looking for, which
 sign it can see, when it has placed itself in the saved memory, where it is
 exploring, when it replans, and what it saved at the end.
