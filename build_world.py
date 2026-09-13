@@ -298,6 +298,13 @@ def build(obstacle=False, config_path=None):
                   rgba="0.2 0.2 0.25 0.0", group="3", contype="8", conaffinity="1",
                   friction="1.6 0.12 0.02", condim="3", margin="0.004",
                   solref="0.002 1", solimp="0.95 0.99 0.001")
+    # The visible footrests reach the hull's front edge. These world-only
+    # clearance shapes stop the hitch before a pedal can enter a wall.
+    for side, y in (("left", 0.14), ("right", -0.14)):
+        ET.SubElement(chair, "geom", name=f"wc_{side}_footrest_clearance",
+                      type="box", pos=fmt(0.48, y, 0.17), size="0.18 0.11 0.025",
+                      rgba="0 0 0 0", group="3", density="0",
+                      contype="8", conaffinity="1", margin="0.003")
     for joint in chair.iter("joint"):
         name = joint.get("name") or ""
         if "base_free" in name:

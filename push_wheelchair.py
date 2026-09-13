@@ -38,13 +38,17 @@ ATTACH_STATES = ("find", "approach", "align", "arm_pregrasp", "move_in", "close"
 ARM_SETUP_BACKOFF = 0.07   # open jaws hover this far behind the tip
 BASE_SLIDE_DISTANCE = 0.07  # must match backoff so the tip actually enters the jaws
 APPROACH_STANDOFF = 0.55    # park this far behind the rear marker before pinching
+# Inflated chair footprint in its own frame: wheels/frame plus robot clearance.
+CHAIR_REAR_X, CHAIR_FRONT_X, CHAIR_SIDE_Y = -0.70, 0.85, 0.64
+DETOUR_REAR_X, DETOUR_FRONT_X, DETOUR_SIDE_Y = -0.94, 1.02, 0.84
 ARM_SETTLE_S = 6.0
 LINEUP_STATES = ("find", "approach")
 CLOSE_SETTLE_S = 6.0
 VERIFY_SETTLE_S = 5.0
 OPEN_GRIP = 1.0
-CLOSED_GRIP = {"right": 0.14, "left": 0.14}
+CLOSED_GRIP = {"right": 0.0, "left": 0.0}
 PAD_CENTER_OFFSET = 0.021  # 13 mm tip half-thickness + 6 mm pad + 2 mm clearance
+SAFE_POSE_AGE_S = 0.2  # keep rollback clear of the contact boundary
 
 
 def obj_id(model, kind, name):
@@ -70,6 +74,39 @@ def handle_targets(marker_pose):
     center, x_axis, y_axis = marker_pose
     common = center + MARKER_TO_TIP * x_axis + np.array([0, 0, 0.116])
     return {"right": common - 0.18 * y_axis, "left": common + 0.18 * y_axis}
+
+
+def chair_avoidance_waypoints(start, marker_pose):
+    """Route around the inflated wheelchair footprint to its rear centerline."""
+    center, x_axis, y_axis = marker_pose
+    chair_origin = center[:2] + 0.231 * x_axis[:2]
+    def local(point):
+        delta = np.asarray(point)[:2] - chair_origin
+        return np.array([np.dot(delta, x_axis[:2]), np.dot(delta, y_axis[:2])])
+    def world(point):
+        return chair_origin + point[0] * x_axis[:2] + point[1] * y_axis[:2]
+    goal = local(center[:2] - APPROACH_STANDOFF * x_axis[:2])
+    source = local(start)
+    # A segment enters the chair envelope if any interval overlaps in x and y.
+    low, high = 0.0, 1.0
+    for index, bounds in enumerate(((CHAIR_REAR_X, CHAIR_FRONT_X),
+                                    (-CHAIR_SIDE_Y, CHAIR_SIDE_Y))):
+        delta = goal[index] - source[index]
+        if abs(delta) < 1e-9:
+            if not bounds[0] <= source[index] <= bounds[1]:
+                return []
+            continue
+        a, b = sorted(((bounds[0] - source[index]) / delta,
+                       (bounds[1] - source[index]) / delta))
+        low, high = max(low, a), min(high, b)
+    if low > high:
+        return []
+    side = 1 if source[1] >= 0 else -1
+    points = []
+    if source[0] > CHAIR_FRONT_X:
+        points.append((DETOUR_FRONT_X, side * DETOUR_SIDE_Y))
+    points.append((DETOUR_REAR_X, side * DETOUR_SIDE_Y))
+    return [world(point) for point in points]
 
 
 def solve_grasp_ik(model, data, targets, handle_axis):
@@ -182,6 +219,7 @@ class PushController:
         self.chair_qadr = model.jnt_qposadr[chair_joint]
         self.chair_dadr = model.jnt_dofadr[chair_joint]
         self.linked = False
+        self.grasp_locked = False
         self.manual = False
         self.hitch = None
         self.drive_phase = -1
@@ -195,27 +233,30 @@ class PushController:
         }
         self.grip_latched = set()
         self.clamp_since = None
-        self.wall_geoms = {
+        self.barrier_geoms = {
             gid for gid in range(model.ngeom)
-            if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith("wall_")
+            if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or "").startswith(("wall_", "obstacle_"))
         }
         self.robot_col = {obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
                           for name in ("col_base", "col_mast")}
         self.hull_id = obj_id(model, mujoco.mjtObj.mjOBJ_GEOM, "wc_hull")
-        self.block_geoms = {self.hull_id} | self.robot_col
-        # Chair mesh collisions (wheels, rails, …) — muted while hitched so the
-        # pair is one vehicle colliding through the hull + robot body only.
+        # Every chair part, including wheels, rails, handles and footrests,
+        # remains collidable while hitched.
         self.chair_mesh_geoms = []
         for gid in range(model.ngeom):
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
             if name.startswith("wc_") and name != "wc_hull":
                 self.chair_mesh_geoms.append(
                     (gid, int(model.geom_contype[gid]), int(model.geom_conaffinity[gid])))
-        self._safe_xy = None
+        self.block_geoms = {gid for gid, _, _ in self.chair_mesh_geoms} | {self.hull_id} | self.robot_col
+        self._safe_pose = None
+        self._safe_pose_time = None
+        self._barrier_blocked = False
+        self._barrier_origin = None
         self._planned_arms = False
         self.lineup_manual = False
-        self.lineup_accepted = False
         self._approach_settle = None
+        self._align_settle = None
         self._approach_report = -1.0
         self.marker_site = obj_id(model, mujoco.mjtObj.mjOBJ_SITE, "wc_rear_marker_center")
         self.weld_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, "chair_hitch")
@@ -223,6 +264,7 @@ class PushController:
             data.eq_active[self.weld_id] = 0
         self.marker_pose = self.marker_from_chair()
         self._hold_xy = None
+        self.approach_waypoints = chair_avoidance_waypoints(self.base.pose()[:2], self.marker_pose)
 
     def change(self, state):
         self.state, self.state_start = state, self.data.time
@@ -230,6 +272,8 @@ class PushController:
             self.drive_phase = -1
         if state == "approach":
             self._approach_settle = None
+        if state == "align":
+            self._align_settle = None
         if state in ("arm_pregrasp", "close", "verify"):
             self._hold_xy = self.data.qpos[self.base.qadr:self.base.qadr + 2].copy()
         else:
@@ -248,12 +292,8 @@ class PushController:
 
     def set_chair_mesh_collisions(self, enabled):
         for gid, contype, conaffinity in self.chair_mesh_geoms:
-            if enabled:
-                self.model.geom_contype[gid] = contype
-                self.model.geom_conaffinity[gid] = conaffinity
-            else:
-                self.model.geom_contype[gid] = 0
-                self.model.geom_conaffinity[gid] = 0
+            self.model.geom_contype[gid] = contype
+            self.model.geom_conaffinity[gid] = conaffinity
 
     def link_chair(self):
         """Lock the chair to the robot; they drive as one vehicle."""
@@ -264,14 +304,31 @@ class PushController:
         self.hitch = (c * dx + s * dy, -s * dx + c * dy, wrap(cyaw - ryaw),
                       float(self.data.qpos[self.chair_qadr + 2]))
         self.linked = True
-        self.set_chair_mesh_collisions(False)
+        self.set_chair_mesh_collisions(True)
         self.apply_hitch()
-        self._safe_xy = (
-            self.data.qpos[self.base.qadr:self.base.qadr + 2].copy(),
-            self.data.qpos[self.chair_qadr:self.chair_qadr + 2].copy(),
-        )
+        self._safe_pose = self.data.qpos.copy()
+        self._safe_pose_time = self.data.time
+        self._barrier_blocked = False
+        self._barrier_origin = None
         print(f"  one body at ({self.hitch[0]:+.2f}, {self.hitch[1]:+.2f}) m, "
               f"{math.degrees(self.hitch[2]):+.1f} deg in the robot frame", flush=True)
+
+    def lock_grasp(self):
+        """Freeze the verified arm and finger servo targets at their contact pose."""
+        clamped, contacts = self.clamp_status()
+        if not clamped:
+            raise RuntimeError(f"cannot lock an incomplete grasp: {contacts}")
+        self.arms.hold_current()
+        self.grasp_locked = True
+        print("  grippers locked at verified handle contacts; X releases them", flush=True)
+
+    def release_grasp(self):
+        self.grasp_locked = False
+        self.linked = False
+        self.hitch = None
+        self._barrier_blocked = False
+        self._barrier_origin = None
+        self.set_chair_mesh_collisions(True)
 
     def attach_chair(self):
         """Line up from the known chair pose, then reach and pinch."""
@@ -281,20 +338,18 @@ class PushController:
         if self.state in ATTACH_STATES:
             print("already lining up on the wheelchair", flush=True)
             return
-        self.linked = False
-        self.hitch = None
-        self.set_chair_mesh_collisions(True)
+        self.release_grasp()
         self.manual = False
         self.marker_pose = self.marker_from_chair()
+        self.approach_waypoints = chair_avoidance_waypoints(self.base.pose()[:2], self.marker_pose)
         self.grip_latched.clear()
         self.clamp_since = None
         self._planned_arms = False
         self.lineup_manual = False
-        self.lineup_accepted = False
         self._approach_settle = None
         self.arms.gripper("right", OPEN_GRIP)
         self.arms.gripper("left", OPEN_GRIP)
-        print("lining up on the wheelchair; arrows nudge, Space starts the pinch", flush=True)
+        print("lining up on the wheelchair; arrows nudge, Space resumes auto alignment", flush=True)
         self.change("approach")
 
     def detach_chair(self):
@@ -305,9 +360,7 @@ class PushController:
             self.base.stop()
             self.manual = True
             self.change("drive")
-        self.linked = False
-        self.hitch = None
-        self.set_chair_mesh_collisions(True)
+        self.release_grasp()
         self.arms.gripper("right", OPEN_GRIP)
         self.arms.gripper("left", OPEN_GRIP)
         for name, value in PARK_ARM.items():
@@ -340,37 +393,55 @@ class PushController:
         self.data.qvel[dadr + 3:dadr + 6] = (0.0, 0.0, w_world[2])
 
     def wall_hits(self):
-        """Outward floor-plane vectors for the pair (hull + robot) vs walls."""
+        """Outward floor-plane vectors for every chair part vs barriers."""
         hits = []
         for contact in self.data.contact:
             if contact.dist >= 0:
                 continue
             pair = {contact.geom1, contact.geom2}
-            if not (pair & self.wall_geoms and pair & self.block_geoms):
+            if not (pair & self.barrier_geoms and pair & self.block_geoms):
                 continue
             normal = np.array(contact.frame[:3], dtype=float)
-            out = -normal if contact.geom1 in self.wall_geoms else normal
+            out = -normal if contact.geom1 in self.barrier_geoms else normal
             hits.append((out[:2], -float(contact.dist)))
         return hits
 
     def block_wall_clip(self):
-        """Keep the one-body hitch from walking through a wall; commands stay live."""
+        """Roll the linked pair back before any chair component clips a barrier."""
         if not self.linked:
             return
         mujoco.mj_forward(self.model, self.data)
         hits = self.wall_hits()
         if not hits:
-            self._safe_xy = (
-                self.data.qpos[self.base.qadr:self.base.qadr + 2].copy(),
-                self.data.qpos[self.chair_qadr:self.chair_qadr + 2].copy(),
-            )
+            if self._safe_pose_time is None or self.data.time - self._safe_pose_time >= SAFE_POSE_AGE_S:
+                self._safe_pose = self.data.qpos.copy()
+                self._safe_pose_time = self.data.time
+            if (self._barrier_origin is not None and
+                    np.linalg.norm(self.data.qpos[self.base.qadr:self.base.qadr + 2]
+                                   - self._barrier_origin) > 0.10):
+                self._barrier_blocked = False
+                self._barrier_origin = None
             return
-        if self._safe_xy is not None:
-            self.data.qpos[self.base.qadr:self.base.qadr + 2] = self._safe_xy[0]
-            self.data.qpos[self.chair_qadr:self.chair_qadr + 2] = self._safe_xy[1]
-            self.data.qvel[self.base.dadr:self.base.dadr + 2] *= 0.2
-            self.data.qvel[self.chair_dadr:self.chair_dadr + 2] *= 0.2
+        if self._safe_pose is not None:
+            # Preserve pitch, wheel and arm dynamics so reverse/turn commands
+            # can escape; only roll back the pair's blocked planar travel.
+            self.data.qpos[self.base.qadr:self.base.qadr + 2] = self._safe_pose[self.base.qadr:self.base.qadr + 2]
+            self.data.qvel[self.base.dadr:self.base.dadr + 2] = 0
+            if self.base.v_cmd > 0:
+                self.base.command(0.0, self.base.w_cmd)
+            self.base.reset_targets()
             self.apply_hitch()
+            mujoco.mj_forward(self.model, self.data)
+            if self.wall_hits():
+                self.data.qpos[self.base.qadr + 3:self.base.qadr + 7] = self._safe_pose[self.base.qadr + 3:self.base.qadr + 7]
+                self.data.qvel[self.base.dadr + 3:self.base.dadr + 6] = 0
+                self.apply_hitch()
+                mujoco.mj_forward(self.model, self.data)
+            if not self._barrier_blocked:
+                self._barrier_blocked = True
+                self._barrier_origin = self.data.qpos[self.base.qadr:self.base.qadr + 2].copy()
+                self.manual = True
+                print("  wheelchair clearance reached a barrier; steer away with arrows", flush=True)
             self.base.fallen = False
             return
         push = np.zeros(2)
@@ -385,32 +456,27 @@ class PushController:
         self.base.fallen = False
 
     def hold_grippers_on_contact(self):
-        """Hold both fingers of a hand when either pad touches; they are mimicked."""
-        _, contacts = self.clamp_status(min_contacts=1, xy_tolerance=0.06,
-                                        z_tolerance=0.05, require_all=False)
+        """Keep closing until both opposing pads of each hand touch."""
+        _, contacts = self.clamp_status()
         for side in ("right", "left"):
             if any(k[0] == side for k in self.grip_latched):
                 continue
-            if contacts[(side, "lower")] < 1 and contacts[(side, "upper")] < 1:
+            if contacts[(side, "lower")] < 1 or contacts[(side, "upper")] < 1:
                 continue
             name = self.grip_joint[(side, "upper")]
             aid = self.arms.act[name]
             q = float(self.data.qpos[self.model.jnt_qposadr[int(self.model.actuator_trnid[aid, 0])]])
-            if q > 0.28:
-                continue
-            self.arms.gripper(side, q)
             self.grip_latched.add((side, "lower"))
             self.grip_latched.add((side, "upper"))
-            print(f"  {side} hand hit the handle; holding gripper at {q:.2f}", flush=True)
+            print(f"  {side} hand has opposing pad contacts at gripper {q:.2f}", flush=True)
 
-    def clamp_status(self, min_contacts=1, xy_tolerance=0.025, z_tolerance=0.015,
-                     require_all=True):
+    def clamp_status(self, min_contacts=1, xy_tolerance=0.045, z_tolerance=0.015):
         """Require opposing pad-to-handle contacts and near-horizontal faces."""
         d = self.data
         contacts = {(side, jaw): 0 for side in ("right", "left") for jaw in ("lower", "upper")}
         for contact in d.contact:
             pair = {contact.geom1, contact.geom2}
-            if contact.dist > 0:
+            if contact.dist > 0 or abs(contact.frame[2]) < 0.8:
                 continue
             for key, geoms in self.finger_geoms.items():
                 side, _ = key
@@ -424,11 +490,8 @@ class PushController:
                 normal = d.site_xmat[self.pad_site[key]].reshape(3, 3)[:, 2]
                 if (contacts[key] < min_contacts or np.linalg.norm(pos[:2] - handle[:2]) > xy_tolerance
                         or abs((pos[2] - handle[2]) - sign * PAD_CENTER_OFFSET) > z_tolerance
-                        or sign * normal[2] > -0.8) and require_all:
+                        or sign * normal[2] > -0.8):
                     return False, contacts
-        if not require_all and any(sum(contacts[(side, jaw)] for jaw in ("lower", "upper")) < min_contacts
-                                   for side in ("right", "left")):
-            return False, contacts
         return True, contacts
 
     def plan_arm_pose(self, marker_pose, lateral_backoff=0.0, abort=True):
@@ -464,15 +527,16 @@ class PushController:
         y_axis = np.cross((0.0, 0.0, 1.0), x_axis)
         return center, x_axis, y_axis
 
-    def lineup_errors(self, standoff=APPROACH_STANDOFF):
+    def lineup_errors(self, standoff=APPROACH_STANDOFF, waypoint=None):
         """Errors to the known standoff pose behind the wheelchair."""
         center, x_axis, _ = self.marker_pose
         bx, by, yaw = self.base.pose()
-        desired = center[:2] - standoff * x_axis[:2]
+        desired = (center[:2] - standoff * x_axis[:2]
+                   if waypoint is None else np.asarray(waypoint))
         delta = desired - np.array([bx, by])
         dist_goal = float(np.linalg.norm(delta))
         chair_yaw = math.atan2(x_axis[1], x_axis[0])
-        if dist_goal > 0.08:
+        if dist_goal > (0.08 if waypoint is not None else 0.06):
             bearing = math.atan2(delta[1], delta[0])
             yaw_error = wrap(bearing - yaw)
         else:
@@ -481,32 +545,30 @@ class PushController:
         lateral = float(x_axis[0] * delta[1] - x_axis[1] * delta[0])
         return yaw_error, distance, lateral, dist_goal
 
-    def near_enough(self, yaw_error, distance, lateral, dist_goal=None, loose=False):
-        yaw_lim, dist_lim, lat_lim = (0.20, 0.10, 0.10) if loose else (0.10, 0.05, 0.05)
-        goal_lim = 0.14 if loose else 0.07
-        if dist_goal is None:
-            dist_goal = math.hypot(distance, lateral)
-        return (abs(yaw_error) < yaw_lim and abs(distance) < dist_lim
-                and abs(lateral) < lat_lim and dist_goal < goal_lim)
+    def aligned_at_rear(self):
+        """Check the base against the chair frame, not the bearing to a waypoint."""
+        center, x_axis, y_axis = self.marker_from_chair()
+        bx, by, yaw = self.base.pose()
+        offset = np.array([bx, by]) - center[:2]
+        behind_error = float(np.dot(offset, x_axis[:2]) + APPROACH_STANDOFF)
+        center_error = float(np.dot(offset, y_axis[:2]))
+        heading_error = wrap(yaw - math.atan2(x_axis[1], x_axis[0]))
+        return (abs(behind_error) < 0.05 and abs(center_error) < 0.06
+                and abs(heading_error) < 0.08)
 
     def accept_lineup(self):
-        """Skip the rest of auto approach and pinch from the current base pose."""
+        """Resume automatic lineup; Space never bypasses rear alignment."""
         self.marker_pose = self.marker_from_chair()
-        if self.lineup_accepted or self.near_enough(*self.lineup_errors(), loose=True):
-            self.base.stop()
-            print("lineup accepted; reaching for the handles", flush=True)
-            self.change("align")
-            return
-        self.lineup_accepted = True
+        self.approach_waypoints = chair_avoidance_waypoints(self.base.pose()[:2], self.marker_pose)
         self.lineup_manual = False
-        print("lineup accepted; driving in to pinch range (Space again to pinch now)",
-              flush=True)
+        self._approach_settle = None
+        print("lining up at the centered rear grasp pose", flush=True)
 
     def drive_lineup(self, keycode):
         if not self.lineup_manual:
             self.lineup_manual = True
             self.base.stop()
-            print("manual lineup: arrows move, Space starts the pinch, X cancels", flush=True)
+            print("manual lineup: arrows move, Space resumes auto alignment, X cancels", flush=True)
         if keycode == GLFW_KEYS["space"]:
             return
         if keycode == GLFW_KEYS["up"]:
@@ -521,31 +583,34 @@ class PushController:
 
     def tick(self):
         d = self.data
-        # Always refresh the known chair pose while lining up / reaching.
+        # Always refresh the chair pose while lining up / reaching.
         if self.state in ("find", "approach", "align", "arm_pregrasp", "move_in"):
-            if not self.lineup_accepted:
-                self.marker_pose = self.marker_from_chair()
+            self.marker_pose = self.marker_from_chair()
         if self.state == "find":
             self.change("approach")
         elif self.state == "approach":
-            yaw_error, distance, lateral, dist_goal = self.lineup_errors()
+            waypoint = self.approach_waypoints[0] if self.approach_waypoints else None
+            yaw_error, distance, lateral, dist_goal = self.lineup_errors(waypoint=waypoint)
+            if waypoint is not None and dist_goal < 0.10:
+                self.approach_waypoints.pop(0)
+                self.base.stop()
+                self.base.reset_targets()
+                self._approach_settle = None
+                print(f"  cleared wheelchair waypoint; {len(self.approach_waypoints)} remain", flush=True)
+                waypoint = self.approach_waypoints[0] if self.approach_waypoints else None
+                yaw_error, distance, lateral, dist_goal = self.lineup_errors(waypoint=waypoint)
             if d.time - self._approach_report >= 2.0:
                 self._approach_report = d.time
                 print(f"  lineup yaw={math.degrees(yaw_error):+.1f} deg  "
                       f"goal={dist_goal:.2f} m  offset={distance:+.2f} m  side={lateral:+.2f} m"
                       f"{'  (manual)' if self.lineup_manual else ''}  "
-                      f"- Space starts the pinch", flush=True)
-            if self.near_enough(yaw_error, distance, lateral, dist_goal):
+                      f"- Space resumes auto alignment", flush=True)
+            if waypoint is None and self.aligned_at_rear():
                 if self._approach_settle is None:
                     self._approach_settle = d.time
                 elif d.time - self._approach_settle >= 0.4:
                     self.base.stop()
                     self.change("align")
-            elif (d.time - self.state_start > 14
-                    and self.near_enough(yaw_error, distance, lateral, dist_goal, loose=True)):
-                print("close enough; starting the pinch", flush=True)
-                self.base.stop()
-                self.change("align")
             elif self.lineup_manual:
                 self._approach_settle = None
             else:
@@ -562,7 +627,12 @@ class PushController:
                                       np.clip(2.0 * yaw_error + 0.8 * lateral, -0.55, 0.55))
         elif self.state == "align":
             self.base.stop()
-            if not self._planned_arms:
+            if not self.aligned_at_rear():
+                self._planned_arms = False
+                self.change("approach")
+            elif self._align_settle is None:
+                self._align_settle = d.time
+            elif d.time - self._align_settle >= 0.3 and not self._planned_arms:
                 self._planned_arms = True
                 self.marker_pose = self.marker_from_chair()
                 print("planning the pinch from the wheelchair pose", flush=True)
@@ -615,13 +685,12 @@ class PushController:
                 self.data.qpos[self.base.qadr:self.base.qadr + 2] = self._hold_xy
                 self.data.qvel[self.base.dadr:self.base.dadr + 2] = 0
             clamped, contacts = self.clamp_status()
-            holding, _ = self.clamp_status(min_contacts=1, xy_tolerance=0.05,
-                                           z_tolerance=0.04, require_all=False)
-            if clamped or holding:
+            if clamped:
                 if self.clamp_since is None:
                     self.clamp_since = d.time
                 elif d.time - self.clamp_since >= 0.5:
                     print(f"both handles clamped: {contacts}", flush=True)
+                    self.lock_grasp()
                     self.link_chair()
                     self.change("drive")
             else:
